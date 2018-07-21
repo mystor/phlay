@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+
+from collections import OrderedDict
+from argparse import ArgumentParser
+import shutil
+import subprocess
+import re
+import sys
+import json
+import tempfile
+import os
+
+
+class UserError(Exception):
+    """Error types used for errors presented to user"""
+    def __init__(self, message, commit=None):
+        super().__init__(message)
+        self.message = message
+        self.commit = commit
+
+
+class RefValue:
+    def __init__(self, hash, symbolic=None):
+        self.hash = hash
+        self.symbolic = symbolic
+
+    @classmethod
+    def read_symbolic(cls, name):
+        try:
+            res = subprocess.check_output(['git', 'symbolic-ref', '-q', name])
+            return cls(None, symbolic=res.decode().strip())
+        except subprocess.CalledProcessError:
+            res = subprocess.check_output(['git', 'rev-parse', '--verify', name])
+            return cls(res.decode().strip())
+
+    def write_ref(self, name, deref=False):
+        if self.symbolic is not None:
+            subprocess.check_call(['git', 'symbolic-ref', '-q', name, self.symbolic])
+        else:
+            flags = [] if deref else ['--no-deref']
+            subprocess.check_call(['git', 'update-ref', *flags, name, self.hash])
+
+        if name == 'HEAD':  # Update the index to match the new HEAD
+            subprocess.run(['git', 'reset', '-q'], check=True)
+
+    def push_ref(self, name):
+        pushval = self
+        class PushRef(object):
+            def __enter__(self):
+                self.oldref = RefValue.read_symbolic(name)
+                pushval.write_ref(name)
+            def __exit__(self, _ty, _val, _tb):
+                self.oldref.write_ref(name)
+        return PushRef()
+
+    def __eq__(self, other):
+        return self.hash == other.hash and self.symbolic == other.symbolic
+
+    def __str__(self):
+        return self.symbolic or self.hash
+
+
+class Commit(RefValue):
+    _cache = {}
+
+    LOG_DELIM = '\x1e'
+    FIELDS = OrderedDict(
+        abbrev='%h',
+        commit_hash='%H',
+        tree_hash='%T',
+        parent_hashes='%P',
+
+        author_name='%an',
+        author_email='%ae',
+        author_date='%aD',
+
+        committer_name='%cn',
+        committer_email='%ce',
+        committer_date='%cD',
+
+        subject='%s',
+        raw_body='%B',
+    )
+
+    def __init__(self, abbrev, commit_hash, tree_hash, parent_hashes,
+                 author_name, author_email, author_date, committer_name,
+                 committer_email, committer_date, subject, raw_body):
+        super().__init__(commit_hash)
+        self._cache[self.hash] = self
+
+        self.abbrev = abbrev
+        self.tree_hash = tree_hash
+        self.parent_hashes = parent_hashes.split(',')
+        self.author_name = author_name
+        self.author_email = author_email
+        self.author_date = author_date
+        self.committer_name = committer_name
+        self.committer_email = committer_email
+        self.committer_date = committer_date
+        self.subject = subject
+        self.raw_body = raw_body
+
+        self.bugno = None
+        self.revision_url = None
+        self.revision = None
+
+        # Parse bug number from commit message
+        bugmatch = re.search(r'bug\s+(\d+)', self.subject, re.I)
+        if bugmatch is not None:
+            self.bugno = int(bugmatch.group(1))
+
+        # Parse reviewer from commit message
+        self.reviewers = []
+        for rmatch in re.finditer(r'r((?:[?=,][^,\s]+)+)', self.subject, re.I):
+            self.reviewers += re.split(r'[?=,]', rmatch.group(1))[1:]
+
+        # Parse differential revison from commit message
+        revmatch = re.search(r'^Differential Revision:(.+)$', self.raw_body,
+                             re.I | re.M)
+        if revmatch is not None:
+            self.revision_url = revmatch.group(1).strip()
+            self.revision = self.revision_url.rsplit('/', 1)[-1]
+        self.prettyrev = self.revision or '<<new>>'
+
+    @classmethod
+    def read_range(cls, rev):
+        if '..' not in rev:  # Support single value argument
+            rev = f'{rev}~..{rev}'
+
+        # Call 'git log' to get information about commits in range
+        logfmt = cls.LOG_DELIM.join(cls.FIELDS.values())
+        log = subprocess.check_output(['git', 'log', '-z', '--reverse',
+                                       f'--format={logfmt}', rev])
+
+        # Decode the result of calling 'git log'
+        commits = []
+        for commit in log.decode().split('\x00'):
+            if len(commit) == 0: continue  # Skip empty entries
+
+            # Pair keys with values
+            data = dict(zip(cls.FIELDS.keys(), commit.split(cls.LOG_DELIM)))
+            commits.append(cls(**data))
+        return commits
+
+    @classmethod
+    def read(cls, rev):
+        if isinstance(rev, RefValue):
+            rev = rev.hash
+        if rev in cls._cache:
+            return cls._cache[rev]
+        return cls.read_range(rev)[0]
+
+    def new_with(self, message=None, parents=None):
+        message = message or self.raw_body
+        parents = parents or self.parents
+
+        # Set up the commit environment
+        env = dict(os.environ)
+        env.update(GIT_AUTHOR_NAME=self.author_name,
+                   GIT_AUTHOR_EMAIL=self.author_email,
+                   GIT_AUTHOR_DATE=self.author_date,
+                   GIT_COMMITTER_NAME=self.committer_name,
+                   GIT_COMMITTER_EMAIL=self.committer_email,
+                   GIT_COMMITTER_DATE=self.committer_date)
+        parent_flags = [x for p in parents for x in ('-p', p.hash)]
+        return Commit.read(subprocess.check_output(
+            ['git', 'commit-tree', *parent_flags, self.tree_hash],
+            input=message.encode(), env=env).decode().strip())
+
+    @property
+    def parents(self):
+        return [self.read(h) for h in self.parent_hashes]
+
+
+def arc_diff(commit):
+    with commit.push_ref('HEAD'), tempfile.TemporaryDirectory() as tmpdir:
+        # Create a fake 'git' executable which always reports that there are no
+        # uncommitted or untracked changes, so 'arc' won't complain.
+        fake_git = os.path.join(tmpdir, 'git')
+        with open(fake_git, 'w') as f:
+            f.write(f'''#!/bin/sh
+if [ "$1" != 'status' ]; then
+    PATH="{os.environ['PATH']}" exec git "$@"
+fi
+''')
+        os.chmod(fake_git, 0o777)
+
+        # Run 'arc diff' in the new environment.
+        env = dict(os.environ)
+        env['PATH'] = f'{tmpdir}:{os.environ["PATH"]}'
+        subprocess.run(['arc', 'diff', 'HEAD~'], check=True, env=env)
+
+        # Read the potentially updated 'HEAD' value
+        return Commit.read('HEAD')
+
+
+def do_rewrite(commits):
+    # Record when we rewrite commits so we can reverse the rewrites.
+    rewrites = {}
+
+    def record_rewrite(old, to):
+        if old.hash != to.hash:
+            rewrites[old.hash] = to
+            print(f'note: rewrote {old.abbrev} to {to.abbrev}')
+
+    def get_rewritten(commit):
+        commit = Commit.read(commit)
+        while commit.hash in rewrites:
+            commit = rewrites[commit.hash]
+        return commit
+
+    # Publish commits for review in range.
+    for commit in commits:
+        assert len(commit.parents) == 1
+        parent = get_rewritten(commit.parents[0])
+
+        message = commit.raw_body
+
+        # Rewrite message to add Reviewers and Bug # if new revision.
+        if commit.revision is None:
+            if parent.revision:
+                message += f'\n\nDepends On {parent.revision}'
+            message += (f'\n\nReviewers: ' +
+                        ', '.join(f'{r}!' for r in commit.reviewers))
+            message += f'\n\nBug #: {commit.bugno or "<no bug>"}'
+
+        # Update the parent to be the correct one.
+        reparented = commit.new_with(message=message, parents=[parent])
+        record_rewrite(commit, to=reparented)
+
+        # Run 'arc diff' on the correct commit, to push the revision up.
+        posted = arc_diff(reparented)
+        record_rewrite(reparented, to=posted)
+        print(f'note: differential revision: {posted.revision_url}')
+
+    # Fix up parents on commits after range.
+    for commit in Commit.read_range(f'{commits[-1].hash}..HEAD'):
+        reparented = commit.new_with(parents=map(get_rewritten, commit.parents))
+        record_rewrite(commit, to=reparented)
+
+    # We should be fully rewritten.
+    # Get the updated value of HEAD and write it to the branch.
+    new_head = get_rewritten('HEAD')
+    new_head.write_ref('HEAD', deref=True)
+    print(f'note: updated HEAD to {new_head}')
+
+
+def main():
+    parser = ArgumentParser(
+        description="flay commits into dependent phabricator revisions")
+    parser.add_argument('revspec', nargs='?', default='HEAD')
+    args = parser.parse_args()
+
+    # Read range & do sanity checks
+    commits = Commit.read_range(args.revspec)
+    if len(commits) == 0:
+        raise UserError('empty range')
+
+    try:
+        subprocess.check_call(['git', 'merge-base', '--is-ancestor',
+                               commits[-1].hash, 'HEAD'])
+    except subprocess.CalledProcessError:
+        raise UserError('provided commit range is not an ancestor of HEAD')
+
+    if any(len(c.parents) != 1 for c in commits):
+        raise UserError('merge commit in provided range')
+
+    # Present the range of commits to rewrite
+    print(f'Pushing changes (Depends On {commits[0].parents[0].revision or "<<none>>"}):')
+    for commit in commits:
+        print(f'    {commit.prettyrev}\t{commit.abbrev}\t{commit.subject}')
+
+    if input("\nCorrect commits? (Y/n) ").lower() != 'y':
+        raise UserError('aborted')
+    print()
+
+    do_rewrite(commits)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except UserError as e:
+        print(f'error: {e.message}', file=sys.stderr)
+        if e.commit:
+            print(f'for commit: {e.commit.abbrev} {e.commit.subject}',
+                  file=sys.stderr)
+        sys.exit(1)
