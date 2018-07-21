@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+
+from http.client import HTTPSConnection
+from urllib.parse import urlencode, urlparse
+from subprocess import check_call, check_output, CalledProcessError
+from argparse import ArgumentParser
+from collections import OrderedDict
+from functools import lru_cache
+from tempfile import NamedTemporaryFile
+from pathlib import Path
+import sys
+import os
+import re
+import json
+
+
+class UserError(Exception):
+    pass
+
+
+class ConduitError(Exception):
+    def __init__(self, code, info):
+        super().__init__(f'conduit({code}): {info}')
+        self.code = code
+        self.info = info
+
+
+class Conduit:
+    TOP = Path(check_output(['git', 'rev-parse', '--show-toplevel']).decode().strip())
+    with open(TOP / '.arcconfig') as arcconfig:
+        ARCCONFIG = json.load(arcconfig)
+
+    URL = urlparse(ARCCONFIG['phabricator.uri'])
+    assert URL.scheme == 'https', 'Only HTTPS scheme phabricator.uri supported'
+
+    with open(Path.home() / '.arcrc') as arcrc:
+        ARCRC = json.load(arcrc)
+    for k, v in ARCRC['hosts'].items():
+        kurl = urlparse(k)
+        if urlparse(k).netloc == URL.netloc:
+            TOKEN = v['token']
+            break
+
+    @staticmethod
+    def do(name, **params):
+        body = urlencode({ 'api.token': Conduit.TOKEN, **params })
+        conn = HTTPSConnection(Conduit.URL.netloc)
+        conn.request("POST", f'/api/{name}', body=body)
+        resp = json.load(conn.getresponse())
+        if resp['error_code'] is not None:
+            raise ConduitError(resp['error_code'], resp['error_info'])
+        return resp['result']
+
+
+class Commit:
+    chosen = False
+    cached = {}
+
+    # Fields pulled from 'git show'
+    abbrev          = '%h'
+    commit_hash     = '%H'
+    tree_hash       = '%T'
+    parent_hashes   = '%P'
+    author_name     = '%an'
+    author_email    = '%ae'
+    author_date     = '%aD'
+    committer_name  = '%cn'
+    committer_email = '%ce'
+    committer_date  = '%cD'
+    subject         = '%s'
+    raw_body        = '%B'
+
+    def __new__(cls, rev):
+        # Check if our revision is cached
+        if rev in cls.cached:
+            return cls.cached[rev]
+
+        # Get the revision hash
+        sha = check_output(['git', 'rev-parse', '--verify', rev]).decode().strip()
+        if sha != rev:
+            return Commit.__new__(cls, sha)
+
+        self = super().__new__(cls)
+        cls.cached[rev] = self
+
+        # Read information from 'git show'
+        FIELDS = { k: v for k, v in cls.__dict__.items()
+                   if type(v) == str and v.startswith('%') }
+        FORMAT = '%x00'.join(FIELDS.values())
+
+        info = check_output(['git', 'show', f'--format={FORMAT}', rev]).decode()
+        self.__dict__.update(zip(FIELDS.keys(), info.split('\0')))
+
+        # Compute more info based on the commit message etc.
+        bugmatch = re.search(r'bug\s+(\S+)', self.subject, re.I)
+        self.bugno = bugmatch and bugmatch.group(1)
+
+        self.reviewers = []
+        for rmatch in re.finditer(r'r((?:[?=,][^,\s]+)+)', self.subject, re.I):
+            self.reviewers += re.split(r'[?=,]', rmatch.group(1))[1:]
+
+        urlmatch = re.search(r'^Differential Revision:(.+)$',
+                             self.raw_body, re.I | re.M)
+        self.url = urlmatch and urlmatch.group(1).strip()
+        self.revision = self.url and self.url.rsplit('/', 1)[-1]
+
+        return self
+
+    def parent(self):
+        return Commit(self.parent_hashes) if ' ' not in self.parent_hashes else None
+
+    def is_part_one(self):
+        return self.parent() and self.bugno != self.parent().bugno
+
+    def get_diff(self):
+        return check_output([
+            'git', 'diff-tree',
+            '--no-ext-diff',
+            '--no-textconv',
+            '--submodule=short',
+            '--no-color',
+            '--src-prefix=a/',
+            '--dst-prefix=b/',
+            '-U32767',
+            self.commit_hash
+        ]).decode()
+
+    def __repr__(self):
+        choice = "<y>" if self.chosen else "<n>"
+        return f'<commit {choice} {self.abbrev} {repr(self.subject)}>'
+
+
+# class Commit(RefValue):
+#     _cache = {}
+#
+#     def __init__(self, abbrev, commit_hash, tree_hash, parent_hashes,
+#                  author_name, author_email, author_date, committer_name,
+#                  committer_email, committer_date, subject, raw_body):
+#         super().__init__(commit_hash)
+#         self._cache[self.hash] = self
+# 
+#         self.abbrev = abbrev
+#         self.tree_hash = tree_hash
+#         self.parent_hashes = parent_hashes.split(',')
+#         self.author_name = author_name
+#         self.author_email = author_email
+#         self.author_date = author_date
+#         self.committer_name = committer_name
+#         self.committer_email = committer_email
+#         self.committer_date = committer_date
+#         self.subject = subject
+#         self.raw_body = raw_body
+# 
+#         self.bugno = None
+#         self.revision_url = None
+#         self.revision = None
+# 
+#         # Parse bug number from commit message
+#         bugmatch = re.search(r'bug\s+(\d+)', self.subject, re.I)
+#         if bugmatch is not None:
+#             self.bugno = int(bugmatch.group(1))
+# 
+#         # Parse reviewer from commit message
+#         self.reviewers = []
+#         for rmatch in re.finditer(r'r((?:[?=,][^,\s]+)+)', self.subject, re.I):
+#             self.reviewers += re.split(r'[?=,]', rmatch.group(1))[1:]
+# 
+#         # Parse differential revison from commit message
+#         revmatch = re.search(r'^Differential Revision:(.+)$', self.raw_body,
+#                              re.I | re.M)
+#         if revmatch is not None:
+#             self.revision_url = revmatch.group(1).strip()
+#             self.revision = self.revision_url.rsplit('/', 1)[-1]
+#         self.prettyrev = self.revision or '<<none>>'
+# 
+#     def new_with(self, message=None, parents=None):
+#         message = message or self.raw_body
+#         parents = parents or self.parents
+# 
+#         # Set up the commit environment
+#         env = dict(os.environ)
+#         env.update(GIT_AUTHOR_NAME=self.author_name,
+#                    GIT_AUTHOR_EMAIL=self.author_email,
+#                    GIT_AUTHOR_DATE=self.author_date,
+#                    GIT_COMMITTER_NAME=self.committer_name,
+#                    GIT_COMMITTER_EMAIL=self.committer_email,
+#                    GIT_COMMITTER_DATE=self.committer_date)
+#         pflags = [x for p in parents for x in ('-p', p.hash)]
+#         stdout = check_output(['git', 'commit-tree', *pflags, self.tree_hash],
+#                               input=message.encode(), env=env)
+#         return mkcommit(stdout.decode().strip())
+# 
+#     @property
+#     def parents(self):
+#         return [mkcommit(h) for h in self.parent_hashes]
+
+
+def interesting(maxn):
+    cmt = Commit('HEAD')
+    while maxn > 0 and cmt.parent():
+        yield cmt
+        cmt = cmt.parent()
+        maxn -= 1
+
+
+def prompt_select_commits(maxn):
+    commits = list(interesting(maxn))
+    commits.reverse()
+
+    with NamedTemporaryFile('w+', prefix='phlay_commits') as f:
+        for commit in commits:
+            if commit.is_part_one():
+                print(f'\n# Bug {commit.bugno}', file=f)
+            print(commit.abbrev, commit.revision, commit.subject, sep='\t', file=f)
+        f.flush()
+
+        check_call(f'{os.environ["EDITOR"]} "{f.name}"', shell=True)
+        f.seek(0)
+        chosen = [Commit(l.split()[0]) for l in f.readlines()
+                  if not l.isspace() and not l.startswith('#')]
+
+    # Mark chosen commits as 'chosen'
+    found = False
+    for commit in commits:
+        if commit in chosen:
+            commit.chosen = True
+            found = True
+        elif not found:
+            continue
+        yield commit
+
+
+def main():
+    parser = ArgumentParser(description='flay commits onto phabricator')
+    parser.add_argument('--num-commits', '-n', type=int, default=30)
+    args = parser.parse_args()
+
+    print(conduit('user.whoami'))
+
+    # Get the list of commits to consider in chronological order
+    commits = list(prompt_select_commits(args.num_commits))
+
+    for commit in commits:
+        print(commit)
+        if commit.chosen:
+            print(commit.get_diff())
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except UserError as e:
+        print(f'error: {str(e)}', file=sys.stderr)
+        sys.exit(1)
