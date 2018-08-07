@@ -9,9 +9,11 @@ number, reviewers, and dependencies.
 This tool depends on:
 
   - The `git-cinnabar` version of `arc` (https://github.com/mozilla-conduit/arcanist) being on the path,
-  - A sufficiently recent version of `git`, and
+  - Git >= 2.11 as 'git', and
   - Python >= 3.6 as 'python3'.
 
 NOTE: This is a hacky tool made for my own use, probably don't depend on it
 unless you're OK with it breaking.
 
+NOTE: There's a chance that your git version isn't quite new enough, in which
+case you'll have to get an updated git on the path to use 'phlay'.
