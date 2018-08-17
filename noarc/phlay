@@ -17,9 +17,9 @@ class Style:
     COLORS = 'black blue cyan green magenta red white yellow'.split()
     SUGAR = dict(reset='sgr0', italic='sitm')
 
-    def __init__(self, styled=sys.stdout.isatty()):
-        self.styled = styled
-        if styled:
+    def __init__(self, color, stream=sys.stdout):
+        self.styled = color == 'always' or (color == 'auto' and stream.isatty())
+        if self.styled:
             curses.setupterm()
             self._setf = curses.tigetstr('setaf') or curses.tigetstr('setf')
 
@@ -35,8 +35,6 @@ class Style:
 
 class UserError(Exception):
     pass
-
-
 
 
 class Conduit:
@@ -143,7 +141,8 @@ class Bug(Cached):
     def info(self, _conduit):
         if self._info is None:
             conn = HTTPSConnection('bugzilla.mozilla.org')
-            conn.request('GET', f'/rest/bug/{self.bugno}?include_fields=summary,resolution,status')
+            conn.request('GET',
+                f"/rest/bug/{self.bugno}?include_fields=summary,status")
             resp = json.load(conn.getresponse())
             if resp.get('error', False):
                 raise UserError(resp['message'])
@@ -285,18 +284,7 @@ class Commit(Cached):
         return f'<commit {self.abbrev} {repr(self.subject)}>'
 
 
-def main(style):
-    parser = ArgumentParser(description='phlay commits onto differential')
-    parser.add_argument('--ref', '-r', nargs=1, default='HEAD',
-                        help='git ref to update after rewriting commits')
-    parser.add_argument('--assume-yes', '-y', action='store_true',
-                        help='disable confirmation prompts')
-    parser.add_argument('--arcrc', nargs=1, default='~/.arcrc',
-                        help='arc configuration file')
-    parser.add_argument('revspec', nargs='?', default='HEAD',
-                        help='commit range to phlay onto differential')
-    args = parser.parse_args()
-
+def get_revisions(args):
     # Check our 'ref' argument
     if args.ref != 'HEAD':
         # Limit to '--heads' if no path is provided
@@ -308,10 +296,6 @@ def main(style):
         ref = lines[0].split()[1]
     else:
         ref = 'HEAD'
-    refcommit = Commit(ref)
-
-    # Establish a connection to Conduit
-    conduit = Conduit(args.arcrc)
 
     # Determine which commits to reparent vs. push
     if '..' in args.revspec:
@@ -320,7 +304,7 @@ def main(style):
         end = Commit(args.revspec)
         start = end.parent()
 
-    current = refcommit
+    current = Commit(ref)
     reparent = []
     while current != end:
         if current is None:
@@ -339,6 +323,18 @@ def main(style):
 
     if len(push) == 0:
         raise UserError('no commits specified')
+
+    return start, ref, push, reparent
+
+
+def process_args(args):
+    # Set up state for arguments
+    style = Style(args.color)
+    conduit = Conduit(args.arcrc)
+    start, ref, push, reparent = get_revisions(args)
+
+    # Stash the current sha1 for |ref|
+    initial_ref = Commit(ref)
 
     # Define a helper for printing styled & labeled information to stdout.
     def label(label, *rest, warn=False):
@@ -466,20 +462,39 @@ def main(style):
         parent = commit.recommit(parent, commit.raw_body)
 
     # Rewrite 'ref'
-    if refcommit != parent:
+    if initial_ref != parent:
         print(f"{style.bold}Updating {style.yellow}{ref}{style.reset}")
-        label('Old Value', refcommit.commit_hash)
+        label('Old Value', initial_ref.commit_hash)
         label('New Value', parent.commit_hash)
         check_output([
             'git', 'update-ref', '-m', 'phlay: rewrite',
-            ref, parent.commit_hash, refcommit.commit_hash,
+            ref, parent.commit_hash, initial_ref.commit_hash,
         ])
 
 
-if __name__ == '__main__':
-    style = Style()
+def main():
+    parser = ArgumentParser(description='phlay commits onto differential')
+    parser.add_argument('--ref', '-r', nargs=1, default='HEAD',
+                        help='git ref to update after rewriting commits')
+    parser.add_argument('--assume-yes', '-y', action='store_true',
+                        help='disable confirmation prompts')
+    parser.add_argument('--arcrc', nargs=1, default='~/.arcrc',
+                        help='arc configuration file')
+    parser.add_argument('--color', default='auto',
+                        choices=['always', 'never', 'auto'],
+                        help='control output colorization')
+    parser.add_argument('revspec', nargs='?', default='HEAD',
+                        help='commit range to phlay onto differential')
+    args = parser.parse_args()
+
     try:
-        main(style)
+        process_args(args)
     except UserError as e:
-        print(f'{style.red}{style.bold}error{style.reset} {str(e)}', file=sys.stderr)
+        style = Style(args.color, stream=sys.stderr)
+        print(f'{style.red}{style.bold}error{style.reset} {str(e)}',
+              file=sys.stderr)
         sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
