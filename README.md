@@ -15,5 +15,14 @@ This tool depends on:
 NOTE: This is a hacky tool made for my own use, probably don't depend on it
 unless you're OK with it breaking.
 
-NOTE: There's a chance that your git version isn't quite new enough, in which
-case you'll have to get an updated git on the path to use 'phlay'.
+NOTE: There's a chance that your git version isn't quite recent enough, in which
+case you'll need to use the `noarc` branch, or get an updated git on the path.
+
+## WIP `noarc` branch
+
+**NOTE** This version of the tool depends on the default phabricator command
+line tool `arc`. The [`noarc`](https://github.com/mystor/phlay/tree/noarc)
+branch contains a WIP alternate implementation which instead directly talks to
+conduit endpoints.
+
+Please let me know about problems you run into when using `noarc`!
