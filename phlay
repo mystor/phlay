@@ -200,7 +200,7 @@ class Commit(Cached):
         self.parent_hashes = self.parent_hashes.split()
 
         # Compute more info based on the commit message etc.
-        bugmatch = re.search(r'bug\s+(\S+)', self.subject, re.I)
+        bugmatch = re.search(r'bug\s+(\d+)', self.subject, re.I)
         self.bug = bugmatch and Bug(bugmatch.group(1))
 
         # Parse the reviewer list
