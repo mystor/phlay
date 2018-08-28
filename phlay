@@ -416,7 +416,8 @@ def process_args(args):
 
     # Request user confirmation of printed information.
     if not args.assume_yes:
-        if input(f"{style.bold}Proceed?{style.reset} (Y/n) ").lower() != 'y':
+        prompt_response = input(f"{style.bold}Proceed?{style.reset} (Y/n) ")
+        if prompt_response.lower() not in ('y', ''):
             raise UserError('user aborted')
         print()
 
