@@ -2,7 +2,7 @@
 
 from http.client import HTTPSConnection
 from urllib.parse import urlencode, urlparse
-from subprocess import check_output
+from subprocess import check_output, CalledProcessError
 from argparse import ArgumentParser
 from pathlib import Path
 import sys
@@ -10,6 +10,8 @@ import os
 import re
 import json
 import curses
+import base64
+import socket
 
 
 class Style:
@@ -65,6 +67,9 @@ class Conduit:
             'callsigns': [arcconfig['repository.callsign']]
         })
 
+        self.user = self.do('user.whoami')
+        self.hostname = socket.gethostname()
+
     def do(self, name, **params):
         # Add the token & write out parameters.
         params['__conduit__'] = { 'token': self.token }
@@ -92,6 +97,215 @@ class Conduit:
         if len(resp['data']) != 1:
             raise UserError(f'cannot find {what} (constraints={constraints})')
         return resp['data'][0]
+
+
+class Hunk:
+    def __new__(self, a_offset, a_length, b_offset, b_length):
+        self.a_offset = a_offset
+        self.a_length = a_length
+        self.b_offset = b_offset
+        self.b_length = b_length
+        self.corpus = []
+
+    def to_conduit(self, _conduit):
+        return {
+            'oldOffset': self.a_offset,
+            'oldLength': self.a_length,
+            'newOffset': self.b_offset,
+            'newLength': self.b_length,
+            'corpus': '\n'.join(self.corpus),
+        }
+
+
+class Change:
+    """Individual file change as part of a changeset"""
+    # I just love magic numbers~!
+    TYPE_ADD        = 1
+    TYPE_CHANGE     = 2
+    TYPE_DELETE     = 3
+    TYPE_MOVE_AWAY  = 4
+    TYPE_COPY_AWAY  = 5
+    TYPE_MOVE_HERE  = 6
+    TYPE_COPY_HERE  = 7
+    TYPE_MULTICOPY  = 8
+    TYPE_MESSAGE    = 9
+    TYPE_CHILD      = 10
+
+    FILE_TEXT       = 1
+    FILE_IMAGE      = 2
+    FILE_BINARY     = 3
+    FILE_DIRECTORY  = 4
+    FILE_SYMLINK    = 5
+    FILE_DELETED    = 6
+    FILE_NORMAL     = 7
+
+    def __new__(self, a_mode, b_mode, a_sha, b_sha, kind, a_path, b_path):
+        self.a_mode = a_mode
+        self.b_mode = b_mode
+        self.a_blob = Blob(a_sha)
+        self.b_blob = Blob(b_sha)
+        self.kind = kind
+        self.a_path = a_path
+        self.b_path = b_path
+
+        # Information about diff state
+        self.hunks = []
+        self.added = 0
+        self.removed = 0
+        self.binary = False
+
+    def to_conduit(self, conduit):
+        # Upload binary blobs if necessary.
+        metadata = {}
+        if self.binary and self.b_blob.body() is not None:
+            data_base64 = base64.standard_b64encode(self.b_blob.body()).decode()
+            binary_phid = conduit.do('file.upload', data_base64=data_base64)
+            metadata = {
+                'old:file-size': len(self.a_blob.body()),
+                'new:file-size': len(self.b_blob.body()),
+                'new:binary-phid': binary_phid,
+                # XXX(nika): Guess mime type?
+            }
+
+        # XXX(nika): Support more change types?
+        changeType = 0
+        oldPath = self.a_path
+        if self.kind.startswith('A'):
+            changeType = self.TYPE_ADD
+            oldPath = None
+        elif self.kind.startswith('D'):
+            changeType = self.TYPE_DELETE
+        elif self.kind.startswith('R'):
+            changeType = self.TYPE_MOVE_HERE
+
+        return {
+            'metadata': metadata,
+            'oldProperties': { 'unix:filemode': self.a_mode },
+            'newProperties': { 'unix:filemode': self.b_mode },
+            'oldPath': oldPath,
+            'currentPath': self.b_path,
+            'addLines': self.added,
+            'delLines': self.removed,
+            'type': changeType,
+            'fileType': self.FILE_BINARY if self.binary else self.FILE_TEXT,
+            'hunks': [hunk.to_conduit(conduit) for hunk in self.hunks],
+        }
+
+
+class Diff:
+    """simple diff parser"""
+    def __init__(self, commit):
+        self.commit = commit
+        self.changes = {}
+
+        # Get a combined raw & patch diff from git diff-tree. The sections will
+        # be separated by '\0\0'.
+        [raw, patch] = check_output([
+            'git', 'diff-tree', '-r',
+            '--no-ext-diff', '--no-textconv', '--no-color', # No customization
+            '--raw', '-z',        # Add easy-to-parse \0-separated header
+            '--patch', '-U32767', # Include all patch context
+            '--full-index',       # Don't abbreviate the index sha1s
+            commit.commit_hash
+        ]).decode().split('\0\0', maxsplit=1)
+
+        # Split the raw section on '\0:', the delimiter between raw changes
+        [junk, *raw_changes] = raw.split('\0:')
+        assert junk == commit.commit_hash, "unexpected junk leader!"
+        for change in raw_changes:
+            # '--raw -z' only uses '\0' to split paths, other sections are still
+            # space-separated.
+            [fields, a_path, *rest] = change.split('\0')
+            [a_mode, b_mode, a_hash, b_hash, kind] = fields.split(' ')
+
+            # Determine which paths we are working with.
+            b_path = a_path
+            if len(rest) == 1:
+                b_path = rest[0]
+
+            # Create the change for this raw change.
+            key = f"{a_hash}..{b_hash}"
+            self.changes[key] = \
+                Change(a_mode, b_mode, a_hash, b_hash, kind, a_path, b_path)
+
+        # Walk through lines in the patch. Reading an 'index' line will switch
+        # to a new diff entry.
+        active_change = None
+        active_hunk = None
+        a_hunk_remaining = 0
+        b_hunk_remaining = 0
+        for line in patch.splitlines():
+            # Check for entering a new entry's header
+            indexmatch = re.match(r'index ([a-f0-9]{40}..[a-f0-9]{40})', line, re.I)
+            if indexmatch:
+                active_change = self.changes[indexmatch.group(1)]
+                continue
+            elif active_change is None:
+                continue
+
+            # Detect binary diffs
+            if line.startswith('Binary files'): # XXX(nika): more robust?
+                assert len(active_change.hunks) == 0, "binary files have no hunks"
+                active_change.binary = True
+            if active_change.binary:
+                continue
+
+            # Detect hunks
+            hunkmatch = re.match(r'@@ -(\d+),(\d+) \+(\d+),(\d+) @@', line, re.I)
+            if hunkmatch:
+                active_hunk = Hunk(int(hunkmatch.group(1)),
+                                   int(hunkmatch.group(2)),
+                                   int(hunkmatch.group(3)),
+                                   int(hunkmatch.group(4)))
+                active_change.hunks.append(active_hunk)
+
+                # Keep track of how many lines are remaining for each hunk.
+                a_hunk_remaining = active_hunk.a_length
+                b_hunk_remaining = active_hunk.b_length
+                continue
+            elif active_hunk is None:
+                continue
+
+            # Add additions, removals, and context to the current hunk.
+            if line[0] == '+':
+                assert b_hunk_remaining > 0
+                active_change.added += 1
+                b_hunk_remaining -= 1
+                active_hunk.corpus.append(line)
+
+            if line[0] == '-':
+                assert a_hunk_remaining > 0
+                active_change.removed += 1
+                a_hunk_remaining -= 1
+                active_hunk.corpus.append(line)
+
+            if line[0] == ' ':
+                a_hunk_remaining -= 1
+                b_hunk_remaining -= 1
+                active_hunk.corpus.append(line)
+
+            # If we've seen all of the lines for the current hunk, end it.
+            if a_hunk_remaining == 0 and b_hunk_remaining == 0:
+                active_hunk = None
+
+    def to_conduit(self, conduit):
+        changes = [ch.to_conduit(conduit) for ch in self.changes.values()]
+        return conduit.do('differential.creatediff',
+                          changes=changes,
+                          sourceMachine=conduit.hostname,
+                          # XXX(nika): say git if non-public commit?
+                          sourceControlSystem='hg',
+                          sourceControlPath='',
+                          sourceControlBaseRevision=self.commit.parent().hg_hash,
+                          creationMethod='phlay',
+                          lintStatus='none',
+                          unitStatus='none',
+                          repositoryPHID=conduit.repository['phid'],
+
+                          # XXX(nika): Why send this?
+                          sourcePath=conduit.top,
+                          # XXX(nika): This seems kinda irrelevant?
+                          branch='HEAD')
 
 
 class Cached:
@@ -164,6 +378,24 @@ class User(Cached):
         return self._info
 
 
+class Blob(Cached):
+    null_hash = '0' * 40
+    _body = None
+
+    def init(self, hash):
+        self.hash = hash
+
+    def is_null(self):
+        return self.hash == self.null_hash
+
+    def body(self):
+        if self.is_null():
+            return None
+        if self._body is None:
+            self._body = check_output('git', 'cat-file', 'blob', self.hash)
+        return self._body
+
+
 class Commit(Cached):
     # Fields pulled from 'git show'
     abbrev          = '%h'
@@ -219,13 +451,21 @@ class Commit(Cached):
             rev_replace, self.body, count=1, flags=re.I | re.M
         ).strip()
 
+        # Check if this commit has a corresponding hg revision
+        try:
+            self.hg_hash = check_output(['git', 'cinnabar', 'git2hg',
+                                         self.commit_hash])
+        except CalledProcessError:
+            self.hg_hash = '0' * 40 # XXX: uhh? do better?
+
+
     def parent(self):
         if len(self.parent_hashes) == 1:
             return Commit(self.parent_hashes[0])
         return None
 
     def get_diff(self):
-        return check_output([
+        return Diff(check_output([
             'git', 'diff-tree',
             '--no-ext-diff',
             '--no-textconv',
@@ -233,9 +473,10 @@ class Commit(Cached):
             '--no-color',
             '--src-prefix=a/',
             '--dst-prefix=b/',
+            '--patch-with-raw',
             '-U32767',
             self.commit_hash
-        ]).decode()
+        ]).decode())
 
     def add_transaction(self, type, value):
         self.transactions.append({
@@ -430,11 +671,7 @@ def process_args(args):
             if txn['type'] == 'summary':
                 txn['value'] = commit.summary(parent=parent)
 
-        # XXX(nika): Use 'differential.creatediff' instead to get full
-        # flexibility.
-        diff = conduit.do('differential.createrawdiff',
-                          diff=commit.get_diff(),
-                          repositoryPHID=conduit.repository['phid'])
+        diff = commit.get_diff().to_conduit(conduit)
         label('Diff URI', diff['uri'])
         commit.add_transaction('update', diff['phid'])
 
