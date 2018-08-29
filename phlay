@@ -100,7 +100,7 @@ class Conduit:
 
 
 class Hunk:
-    def __new__(self, a_offset, a_length, b_offset, b_length):
+    def __init__(self, a_offset, a_length, b_offset, b_length):
         self.a_offset = a_offset
         self.a_length = a_length
         self.b_offset = b_offset
@@ -123,13 +123,13 @@ class Change:
     TYPE_ADD        = 1
     TYPE_CHANGE     = 2
     TYPE_DELETE     = 3
+
+    # XXX(nika): Add support for moves/copies
     TYPE_MOVE_AWAY  = 4
     TYPE_COPY_AWAY  = 5
     TYPE_MOVE_HERE  = 6
     TYPE_COPY_HERE  = 7
     TYPE_MULTICOPY  = 8
-    TYPE_MESSAGE    = 9
-    TYPE_CHILD      = 10
 
     FILE_TEXT       = 1
     FILE_IMAGE      = 2
@@ -139,7 +139,7 @@ class Change:
     FILE_DELETED    = 6
     FILE_NORMAL     = 7
 
-    def __new__(self, a_mode, b_mode, a_sha, b_sha, kind, a_path, b_path):
+    def __init__(self, a_mode, b_mode, a_sha, b_sha, kind, a_path, b_path):
         self.a_mode = a_mode
         self.b_mode = b_mode
         self.a_blob = Blob(a_sha)
@@ -167,26 +167,18 @@ class Change:
                 # XXX(nika): Guess mime type?
             }
 
-        # XXX(nika): Support more change types?
-        changeType = 0
-        oldPath = self.a_path
-        if self.kind.startswith('A'):
-            changeType = self.TYPE_ADD
-            oldPath = None
-        elif self.kind.startswith('D'):
-            changeType = self.TYPE_DELETE
-        elif self.kind.startswith('R'):
-            changeType = self.TYPE_MOVE_HERE
+        old_props = { 'unix:filemode': self.a_mode } if self.a_path else {}
+        new_props = { 'unix:filemode': self.b_mode } if self.b_path else {}
 
         return {
             'metadata': metadata,
-            'oldProperties': { 'unix:filemode': self.a_mode },
-            'newProperties': { 'unix:filemode': self.b_mode },
-            'oldPath': oldPath,
+            'oldProperties': old_props,
+            'newProperties': new_props,
+            'oldPath': self.a_path,
             'currentPath': self.b_path,
             'addLines': self.added,
             'delLines': self.removed,
-            'type': changeType,
+            'type': self.kind,
             'fileType': self.FILE_BINARY if self.binary else self.FILE_TEXT,
             'hunks': [hunk.to_conduit(conduit) for hunk in self.hunks],
         }
@@ -196,7 +188,9 @@ class Diff:
     """simple diff parser"""
     def __init__(self, commit):
         self.commit = commit
-        self.changes = {}
+        self.changes = []
+
+        hash_to_changes = {}
 
         # Get a combined raw & patch diff from git diff-tree. The sections will
         # be separated by '\0\0'.
@@ -223,10 +217,23 @@ class Diff:
             if len(rest) == 1:
                 b_path = rest[0]
 
+            if kind[0] == 'A':
+                a_path = None
+                phk = Change.TYPE_ADD
+            elif kind[0] == 'D':
+                b_path = None
+                phk = Change.TYPE_DELETE
+            elif kind[0] == 'M':
+                phk = 0
+            else:
+                raise UserError(f"Unhandled change type {kind}")
+
             # Create the change for this raw change.
-            key = f"{a_hash}..{b_hash}"
-            self.changes[key] = \
-                Change(a_mode, b_mode, a_hash, b_hash, kind, a_path, b_path)
+            change = Change(a_mode, b_mode, a_hash, b_hash, phk, a_path, b_path)
+
+            # Add the change to the list in question.
+            self.changes.append(change)
+            hash_to_changes[f"{a_hash}..{b_hash}"] = change
 
         # Walk through lines in the patch. Reading an 'index' line will switch
         # to a new diff entry.
@@ -238,7 +245,7 @@ class Diff:
             # Check for entering a new entry's header
             indexmatch = re.match(r'index ([a-f0-9]{40}..[a-f0-9]{40})', line, re.I)
             if indexmatch:
-                active_change = self.changes[indexmatch.group(1)]
+                active_change = hash_to_changes[indexmatch.group(1)]
                 continue
             elif active_change is None:
                 continue
@@ -288,8 +295,11 @@ class Diff:
             if a_hunk_remaining == 0 and b_hunk_remaining == 0:
                 active_hunk = None
 
+        self.added = sum(c.added for c in self.changes)
+        self.removed = sum(c.removed for c in self.changes)
+
     def to_conduit(self, conduit):
-        changes = [ch.to_conduit(conduit) for ch in self.changes.values()]
+        changes = [ch.to_conduit(conduit) for ch in self.changes]
         return conduit.do('differential.creatediff',
                           changes=changes,
                           sourceMachine=conduit.hostname,
@@ -303,7 +313,7 @@ class Diff:
                           repositoryPHID=conduit.repository['phid'],
 
                           # XXX(nika): Why send this?
-                          sourcePath=conduit.top,
+                          sourcePath=str(conduit.top),
                           # XXX(nika): This seems kinda irrelevant?
                           branch='HEAD')
 
@@ -412,6 +422,9 @@ class Commit(Cached):
     body            = '%b'
     raw_body        = '%B'
 
+    # The current diff cache for this commit
+    _diff = None
+
     @classmethod
     def key(cls, rev):
         if re.fullmatch(r'[a-f0-9]{40}', rev, re.I):
@@ -454,9 +467,10 @@ class Commit(Cached):
         # Check if this commit has a corresponding hg revision
         try:
             self.hg_hash = check_output(['git', 'cinnabar', 'git2hg',
-                                         self.commit_hash])
+                                         self.commit_hash]).decode()
         except CalledProcessError:
-            self.hg_hash = '0' * 40 # XXX: uhh? do better?
+            # XXX(nika): What should we do here?
+            self.hg_hash = '0' * 40
 
 
     def parent(self):
@@ -465,18 +479,9 @@ class Commit(Cached):
         return None
 
     def get_diff(self):
-        return Diff(check_output([
-            'git', 'diff-tree',
-            '--no-ext-diff',
-            '--no-textconv',
-            '--submodule=short',
-            '--no-color',
-            '--src-prefix=a/',
-            '--dst-prefix=b/',
-            '--patch-with-raw',
-            '-U32767',
-            self.commit_hash
-        ]).decode())
+        if not self._diff:
+            self._diff = Diff(self)
+        return self._diff
 
     def add_transaction(self, type, value):
         self.transactions.append({
@@ -613,6 +618,13 @@ def process_args(args):
         elif oldrepo != conduit.repository['phid']:
             raise UserError('specified revision for incorrect repository!')
 
+        # Log computed information about the patch to be pushed
+        diff = commit.get_diff()
+        label('Changes',
+              f"{style.bold}{len(diff.changes)} files{style.reset}, "
+              f"{style.green}+{diff.added}{style.reset}, "
+              f"{style.red}-{diff.removed}{style.reset}")
+
         # Title Updates
         oldtitle = revfields.get('title')
         if oldtitle != commit.subject:
@@ -652,6 +664,7 @@ def process_args(args):
                       f"[:{userinfo['fields']['username']}]")
         if len(to_add) > 0:
             commit.add_transaction('reviewers.add', to_add)
+
 
         print()
 
