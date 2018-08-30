@@ -14,6 +14,9 @@ import base64
 import socket
 
 
+NULL_SHA1 = '0' * 40
+
+
 class Style:
     """ANSI color helper"""
     COLORS = 'black blue cyan green magenta red white yellow'.split()
@@ -70,7 +73,7 @@ class Conduit:
         self.user = self.do('user.whoami')
         self.hostname = socket.gethostname()
 
-    def do(self, name, **params):
+    def do(self, cmd_name, **params):
         # Add the token & write out parameters.
         params['__conduit__'] = { 'token': self.token }
         body = urlencode({
@@ -81,7 +84,7 @@ class Conduit:
 
         # Send the POST request
         conn = HTTPSConnection(self.url.netloc)
-        conn.request("POST", f'/api/{name}', body=body)
+        conn.request("POST", f'/api/{cmd_name}', body=body)
 
         # Read the response as JSON
         resp = json.load(conn.getresponse())
@@ -300,10 +303,9 @@ class Diff:
 
     def to_conduit(self, conduit):
         changes = [ch.to_conduit(conduit) for ch in self.changes]
-        return conduit.do('differential.creatediff',
+        diff = conduit.do('differential.creatediff',
                           changes=changes,
                           sourceMachine=conduit.hostname,
-                          # XXX(nika): say git if non-public commit?
                           sourceControlSystem='hg',
                           sourceControlPath='',
                           sourceControlBaseRevision=self.commit.parent().hg_hash,
@@ -316,6 +318,23 @@ class Diff:
                           sourcePath=str(conduit.top),
                           # XXX(nika): This seems kinda irrelevant?
                           branch='HEAD')
+
+        # Add information about local commits to the patch. This info is needed
+        # by lando.
+        conduit.do('differential.setdiffproperty',
+                   diff_id=diff['diffid'],
+                   name='local:commits',
+                   data=json.dumps({
+                       # XXX(nika): This is likely to be a git hash, but it's
+                       # our best effort. We can't force cinnabar to make a
+                       # mercurial hash right now.
+                       self.commit.hg_hash: {
+                           'author': self.commit.author_name,
+                           'authorEmail': self.commit.author_email,
+                           'time': int(self.commit.unix_date),
+                       }
+                   }))
+        return diff
 
 
 class Cached:
@@ -389,14 +408,13 @@ class User(Cached):
 
 
 class Blob(Cached):
-    null_hash = '0' * 40
     _body = None
 
     def init(self, hash):
         self.hash = hash
 
     def is_null(self):
-        return self.hash == self.null_hash
+        return self.hash == NULL_SHA1
 
     def body(self):
         if self.is_null():
@@ -415,6 +433,7 @@ class Commit(Cached):
     author_name     = '%an'
     author_email    = '%ae'
     author_date     = '%aD'
+    unix_date       = '%at'
     committer_name  = '%cn'
     committer_email = '%ce'
     committer_date  = '%cD'
@@ -424,6 +443,7 @@ class Commit(Cached):
 
     # The current diff cache for this commit
     _diff = None
+    real_hg_hash = True
 
     @classmethod
     def key(cls, rev):
@@ -464,13 +484,20 @@ class Commit(Cached):
             rev_replace, self.body, count=1, flags=re.I | re.M
         ).strip()
 
-        # Check if this commit has a corresponding hg revision
+        # Check if this commit has a corresponding hg revision. Fall back to the
+        # git revision if we can't find a mercurial one.
+        #
+        # XXX(nika): It would be nice to be able to force the creation of
+        # mercurial sha1s for some commits. Perhaps hg bundle parsing?
         try:
             self.hg_hash = check_output(['git', 'cinnabar', 'git2hg',
-                                         self.commit_hash]).decode()
+                                         self.commit_hash]).decode().strip()
         except CalledProcessError:
-            # XXX(nika): What should we do here?
-            self.hg_hash = '0' * 40
+            self.hg_hash = NULL_SHA1
+
+        if self.hg_hash == NULL_SHA1:
+            self.hg_hash = self.commit_hash
+            self.real_hg_hash = False
 
 
     def parent(self):
@@ -624,6 +651,13 @@ def process_args(args):
               f"{style.bold}{len(diff.changes)} files{style.reset}, "
               f"{style.green}+{diff.added}{style.reset}, "
               f"{style.red}-{diff.removed}{style.reset}")
+
+        # Log information about the mercirual base commit hash for first commit.
+        if commit.parent() not in push:
+            hg_base_warning = ''
+            if commit.parent().commit_hash == commit.parent().hg_hash:
+                hg_base_warning = f"{style.red}<git only>{style.reset} "
+            label('Hg Base', f"{hg_base_warning}{commit.parent().hg_hash}")
 
         # Title Updates
         oldtitle = revfields.get('title')
