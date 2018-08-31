@@ -496,6 +496,13 @@ class Commit(Cached):
         if self.hg_hash == NULL_SHA1:
             self.hg_hash = None
 
+        # We can /guess/ whether or not a commit is "public" (pushed to inbound)
+        # based on whether or not it has a cached hg_hash. non-"public" commits
+        # will have a null hg_hash, which is filled in during ensure_hg_hashes.
+        #
+        # Commits with revision IDs are also public.
+        self.is_public = self.hg_hash is not None or self.revision is not None
+
     def parent(self):
         if len(self.parent_hashes) == 1:
             return Commit(self.parent_hashes[0])
@@ -512,20 +519,19 @@ class Commit(Cached):
             'value': value,
         })
 
-    def is_part_one(self):
-        return self.parent() and self.bug != self.parent().bug
-
     def summary(self, parent=None, pending_deps=False):
         summary = self._summary
-        if not self.is_part_one():
-            parent = parent or self.parent()
-            if parent.revision:
-                revid = parent.revision.revid
-            elif pending_deps:
-                revid = "<pending>"
-            else:
-                raise UserError(f"no revision for {parent.abbrev}")
-            summary += f"\n\nDepends on D{revid}"
+        parent = parent or self.parent()
+
+        # If we have a valid parent revision, we can declare a dependency on it.
+        # If we're allowed to have pending dependencies (pending_deps is true),
+        # then we can declare a dependency on '<pending>'. Otherwise, we don't
+        # depend on anything.
+        if parent.revision:
+            summary += f"\n\nDepends on D{parent.revision.revid}"
+        elif pending_deps:
+            summary += f"\n\nDepends on D<pending>"
+
         return summary.strip()
 
     def recommit(self, parent, message):
@@ -695,6 +701,11 @@ def process_args(args):
         # Produce an error if no bug # was specified
         if commit.bug is None:
             raise UserError(f"no bug # specified")
+
+        # Check if we are missing a parent revision to depend on.
+        if not (commit.parent().is_public or commit.parent() in push):
+            print(f"{style.red}{style.bold}warning: parent not public",
+                  f"(no revid, not hg){style.reset}", file=sys.stderr)
 
         # Determine which revision we're working with
         if commit.revision is None:
