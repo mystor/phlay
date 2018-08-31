@@ -519,18 +519,18 @@ class Commit(Cached):
             'value': value,
         })
 
-    def summary(self, parent=None, pending_deps=False):
+    def summary(self, parent, pending_deps=False):
         summary = self._summary
-        parent = parent or self.parent()
 
         # If we have a valid parent revision, we can declare a dependency on it.
         # If we're allowed to have pending dependencies (pending_deps is true),
         # then we can declare a dependency on '<pending>'. Otherwise, we don't
         # depend on anything.
-        if parent.revision:
-            summary += f"\n\nDepends on D{parent.revision.revid}"
-        elif pending_deps:
-            summary += f"\n\nDepends on D<pending>"
+        if parent is not None:
+            if parent.revision:
+                summary += f"\n\nDepends on D{parent.revision.revid}"
+            elif pending_deps:
+                summary += f"\n\nDepends on D<pending>"
 
         return summary.strip()
 
@@ -702,8 +702,12 @@ def process_args(args):
         if commit.bug is None:
             raise UserError(f"no bug # specified")
 
-        # Check if we are missing a parent revision to depend on.
-        if not (commit.parent().is_public or commit.parent() in push):
+        # Determine which commit we're going to depend on, respecting
+        # --no-extern-deps.
+        dep_parent = commit.parent()
+        if args.no_extern_deps and dep_parent is start:
+            dep_parent = None
+        elif not (dep_parent.is_public or dep_parent is not start):
             print(f"{style.red}{style.bold}warning: parent not public",
                   f"(no revid, not hg){style.reset}", file=sys.stderr)
 
@@ -742,7 +746,7 @@ def process_args(args):
 
         # Summary Generation
         oldsummary = revfields.get('summary')
-        summary = commit.summary(pending_deps=commit.parent() in push)
+        summary = commit.summary(dep_parent, pending_deps=dep_parent is not start)
         if oldsummary != summary:
             commit.add_transaction('summary', summary)
             label('Set Summary', summary)
@@ -792,10 +796,12 @@ def process_args(args):
     for commit in push:
         print(f"{style.yellow}{commit.abbrev}{style.reset} {commit.subject}")
 
-        # Update transactions to reflect parent pushed revIDs
-        for txn in commit.transactions:
-            if txn['type'] == 'summary':
-                txn['value'] = commit.summary(parent=parent)
+        # Update transactions to reflect parent pushed revIDs, unless we should
+        # ignore our |start| parent due to --no-extern-deps
+        if not (args.no_extern_deps and parent is start):
+            for txn in commit.transactions:
+                if txn['type'] == 'summary':
+                    txn['value'] = commit.summary(parent)
 
         diff = commit.get_diff().to_conduit(conduit)
         label('Diff URI', diff['uri'])
@@ -846,6 +852,8 @@ def main():
     parser.add_argument('--color', default='auto',
                         choices=['always', 'never', 'auto'],
                         help='control output colorization')
+    parser.add_argument('--no-extern-deps', action='store_true',
+                        help='don\'t depend on revisions outside of push')
     parser.add_argument('revspec', nargs='?', default='HEAD',
                         help='commit range to phlay onto differential')
     args = parser.parse_args()
