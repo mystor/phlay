@@ -389,17 +389,28 @@ class Bug(Cached):
         return self._info
 
 
-class User(Cached):
+class Reviewer(Cached):
     _info = None
 
-    def init(self, username):
-        self.username = username
+    def init(self, tag):
+        self.tag = tag
 
     def info(self, conduit):
         if self._info is None:
-            self._info = conduit.search_one('user', {
-                'usernames': [self.username]
-            })
+            try:
+                # First, we try to locate a user with the reviewer's name.
+                self._info = conduit.search_one('user', {
+                    'usernames': [self.tag]
+                })
+            except UserError:
+                try:
+                    # Then we locate a project based on its slug.
+                    self._info = conduit.search_one('project', {
+                        'slugs': [self.tag]
+                    })
+                except UserError:
+                    raise UserError(f"no such reviewer: {self.tag}")
+
         return self._info
 
 
@@ -464,7 +475,7 @@ class Commit(Cached):
         self.reviewers = []
         for rmatch in re.finditer(r'r((?:[?=,][^,\s]+)+)', self.subject, re.I):
             for name in re.split(r'[?=,]', rmatch.group(1))[1:]:
-                self.reviewers.append(User(name))
+                self.reviewers.append(Reviewer(name))
 
         # Parse the revision out of body, and strip to store in summary.
         self.revision = None
@@ -743,12 +754,17 @@ def process_args(args):
                 .get('reviewers', {}).get('reviewers', [])
         ]
         for reviewer in commit.reviewers:
-            userinfo = reviewer.info(conduit)
-            if userinfo['phid'] not in rev_phids:
-                to_add.append(userinfo['phid'])
-                label('Add Reviewer',
-                      userinfo['fields']['realName'],
-                      f"[:{userinfo['fields']['username']}]")
+            reviewerinfo = reviewer.info(conduit)
+            if reviewerinfo['phid'] not in rev_phids:
+                to_add.append(reviewerinfo['phid'])
+                if reviewerinfo['type'] == 'USER':
+                    label('Add Reviewer',
+                          reviewerinfo['fields']['realName'],
+                          f"[:{reviewerinfo['fields']['username']}]")
+                elif reviewerinfo['type'] == 'PROJ':
+                    label('Add Reviewer',
+                          reviewerinfo['fields']['name'],
+                          f"[#{reviewer.tag}]")
         if len(to_add) > 0:
             commit.add_transaction('reviewers.add', to_add)
 
