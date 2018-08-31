@@ -2,8 +2,9 @@
 
 from http.client import HTTPSConnection
 from urllib.parse import urlencode, urlparse
-from subprocess import check_output, CalledProcessError
+from subprocess import check_output, check_call, CalledProcessError
 from argparse import ArgumentParser
+from tempfile import TemporaryDirectory
 from pathlib import Path
 import sys
 import os
@@ -307,14 +308,12 @@ class Diff:
                           changes=changes,
                           sourceMachine=conduit.hostname,
                           sourceControlSystem='hg',
-                          sourceControlPath='',
+                          sourceControlPath='/',
                           sourceControlBaseRevision=self.commit.parent().hg_hash,
                           creationMethod='phlay',
                           lintStatus='none',
                           unitStatus='none',
                           repositoryPHID=conduit.repository['phid'],
-
-                          # XXX(nika): Why send this?
                           sourcePath=str(conduit.top),
                           # XXX(nika): This seems kinda irrelevant?
                           branch='HEAD')
@@ -325,9 +324,6 @@ class Diff:
                    diff_id=diff['diffid'],
                    name='local:commits',
                    data=json.dumps({
-                       # XXX(nika): This is likely to be a git hash, but it's
-                       # our best effort. We can't force cinnabar to make a
-                       # mercurial hash right now.
                        self.commit.hg_hash: {
                            'author': self.commit.author_name,
                            'authorEmail': self.commit.author_email,
@@ -441,10 +437,6 @@ class Commit(Cached):
     body            = '%b'
     raw_body        = '%B'
 
-    # The current diff cache for this commit
-    _diff = None
-    real_hg_hash = True
-
     @classmethod
     def key(cls, rev):
         if re.fullmatch(r'[a-f0-9]{40}', rev, re.I):
@@ -452,8 +444,8 @@ class Commit(Cached):
         return check_output(['git', 'rev-parse', '--verify', rev]).decode().strip()
 
     def init(self, rev):
-        # XXX(nika): Consider making this part lazy?
         self.transactions = []
+        self._diff = None
 
         # Read information from 'git show'
         FIELDS = { k: v for k, v in Commit.__dict__.items()
@@ -484,21 +476,14 @@ class Commit(Cached):
             rev_replace, self.body, count=1, flags=re.I | re.M
         ).strip()
 
-        # Check if this commit has a corresponding hg revision. Fall back to the
-        # git revision if we can't find a mercurial one.
-        #
-        # XXX(nika): It would be nice to be able to force the creation of
-        # mercurial sha1s for some commits. Perhaps hg bundle parsing?
-        try:
-            self.hg_hash = check_output(['git', 'cinnabar', 'git2hg',
-                                         self.commit_hash]).decode().strip()
-        except CalledProcessError:
-            self.hg_hash = NULL_SHA1
-
+        # Check if this commit has a corresponding mercurial hash already
+        # computed and cached. If we don't, and we need it, we will compute it
+        # later in ensure_hg_hashes.
+        self.hg_hash = check_output([
+            'git', 'cinnabar', 'git2hg', self.commit_hash
+        ]).decode().strip()
         if self.hg_hash == NULL_SHA1:
-            self.hg_hash = self.commit_hash
-            self.real_hg_hash = False
-
+            self.hg_hash = None
 
     def parent(self):
         if len(self.parent_hashes) == 1:
@@ -557,6 +542,75 @@ class Commit(Cached):
         return f'<commit {self.abbrev} {repr(self.subject)}>'
 
 
+def ensure_hg_hashes(commits):
+    """Ensures that the range of commits 'commits' all has valid mercurial
+    hashes. |commits| must be sorted, with the oldest commit at index |0|."""
+
+    # Determine the set of commits which we will make into mercurial commits.
+    # Cinnabar will complain if our base commit's parent doesn't have a
+    # precomputed mercurial hash, so we have to climb until we find a commit
+    # which does.
+    to_hg = []
+    current = commits[0].parent()
+    while not (current and current.hg_hash):
+        if current is None:
+            raise UserError(f'no direct mercurial ancestor!')
+        to_hg.append(current)
+        current = current.parent()
+    to_hg.reverse()
+    to_hg += commits
+
+    # Map from mercurial parent commits to child commits.
+    hg_ptoc = {}
+
+    # Get cinnabar to export a bundle with the specified commits. This will
+    # determine the mercurial hashes for those commits. We then parse the v1
+    # bundle format to extract relevant sha1 values.
+    with TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, 'bundle.hg')
+
+        # XXX(nika): This is probably the slowest part of phlay. Perhaps we could
+        # run it in parallel with the other network/io code (e.g. using asyncio)?
+        # We don't need the information until after you approve selected commits.
+        check_call(['git', 'cinnabar', 'bundle',
+                    '--version', '1', path,
+                    f"{current.commit_hash}..{to_hg[-1].commit_hash}"])
+
+        # The header of each chunk is 84 bytes long (4 bytes of length, 4x20
+        # bytes of sha1 hashes).
+        CHUNK_HEADER = 84
+
+        with open(path, 'rb') as f:
+            # Check the bundle type is an uncompressed v1 bundle.
+            assert f.read(6) == b'HG10UN', "bad bundle type"
+
+            while True:
+                # Read the size of the current section. A size too small to fit
+                # a header means we're done.
+                length = int.from_bytes(f.read(4), byteorder='big')
+                if length <= CHUNK_HEADER:
+                    break
+
+                # Read the header, containing 4x sha1 hashes, and skip the
+                # remaining data.
+                node = f.read(20).hex()
+                parent1 = f.read(20).hex()
+                parent2 = f.read(20).hex()
+                changeset = f.read(20).hex()
+                f.read(length - CHUNK_HEADER)
+
+                assert parent2 == NULL_SHA1, "Should have 1 parent"
+                assert changeset == node, "Changeset should match node"
+
+                # Stash the parent-to-child mapping
+                hg_ptoc[parent1] = node
+
+    # Apply the computed hg_ptoc map to add mercurial hashes
+    for commit in to_hg:
+        assert commit.parent().hg_hash is not None
+        commit.hg_hash = hg_ptoc[commit.parent().hg_hash]
+
+
 def get_revisions(args):
     # Check our 'ref' argument
     if args.ref != 'HEAD':
@@ -609,6 +663,9 @@ def process_args(args):
     # Stash the current sha1 for |ref|
     initial_ref = Commit(ref)
 
+    # Ensure we have a mercurial hash for each commit we want to push.
+    ensure_hg_hashes(push)
+
     # Define a helper for printing styled & labeled information to stdout.
     def label(label, *rest, warn=False):
         color = style.bold + (style.red if warn else style.cyan)
@@ -637,6 +694,9 @@ def process_args(args):
             label('Revision', commit.revision.url(conduit))
         revfields = revinfo.get('fields', {})
 
+        # Log computed mercurial hashes.
+        label('Mercurial', f"{commit.hg_hash}")
+
         # Specify which repository we're working with
         oldrepo = revfields.get('repositoryPHID')
         if not oldrepo:
@@ -651,13 +711,6 @@ def process_args(args):
               f"{style.bold}{len(diff.changes)} files{style.reset}, "
               f"{style.green}+{diff.added}{style.reset}, "
               f"{style.red}-{diff.removed}{style.reset}")
-
-        # Log information about the mercirual base commit hash for first commit.
-        if commit.parent() not in push:
-            hg_base_warning = ''
-            if commit.parent().commit_hash == commit.parent().hg_hash:
-                hg_base_warning = f"{style.red}<git only>{style.reset} "
-            label('Hg Base', f"{hg_base_warning}{commit.parent().hg_hash}")
 
         # Title Updates
         oldtitle = revfields.get('title')
@@ -698,7 +751,6 @@ def process_args(args):
                       f"[:{userinfo['fields']['username']}]")
         if len(to_add) > 0:
             commit.add_transaction('reviewers.add', to_add)
-
 
         print()
 
