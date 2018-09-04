@@ -1,0 +1,377 @@
+#!/usr/bin/env ruby
+
+require 'bundler/inline'
+gemfile do
+  source 'https://rubygems.org'
+  gem 'rugged'
+  gem 'docopt'
+  gem 'json'
+end
+
+require 'net/http'
+require 'base64'
+require 'tmpdir'
+require 'pp'
+
+
+BUGZILLA = URI "https://bugzilla.mozilla.org"
+
+$version = "phray 0.1.0"
+$doc = <<DOCOPT
+Phray your commits onto phabricator
+
+Usage:
+  #{__FILE__} [-y] <commit>
+  #{__FILE__} -h | --help
+  #{__FILE__} --version
+
+Options:
+  -y, --yes   Assume yes.
+  -h, --help  Print help info.
+  --version   Print the current version
+DOCOPT
+
+# Simple Conduit API endpoint. Provides only the minimal required API surface
+class Conduit
+  class Error < StandardError; end
+  class Category; end
+
+  def initialize(repo)
+    # Read configuration files for conduit
+    arcconfig = JSON.load Pathname(repo.workdir) + '.arcconfig'
+    arcrc = JSON.load Pathname('~/.arcrc').expand_path
+
+    # Read the URI from configuration, and get the related token
+    @uri = URI.join arcconfig["phabricator.uri"], 'api/'
+    @token = arcrc['hosts'][@uri.to_s]['token']
+
+    # use metaprogramming to define conduit methods on our object.
+    self.do('conduit.query').each do |cmd, spec|
+      cmd = cmd.to_s
+      *segs, method = cmd.split '.'
+
+      current = self
+      segs.each do |seg|
+        seg = seg.to_sym
+        if !current.respond_to? seg then
+          cat = Category.new
+          current.define_singleton_method(seg) { cat }
+        end
+        current = current.public_send seg
+      end
+
+      # Define the final endpoint method, taking the argument list.
+      this = self
+      current.define_singleton_method("#{method}!".to_sym) do |args = {}|
+        args.keys { |k| raise "bad #{k}" if !spec[:params].include? k }
+        this.do cmd, args
+      end
+    end
+
+    # Determine repository from our callsign
+    @repository = diffusion.repository.search! :constraints => {
+      :callsigns => [arcconfig['repository.callsign']]
+    }
+  end
+
+  # Run a single command on the conduit remote
+  def do(cmd_name, args = {})
+    params = JSON.dump args.merge(:__conduit__ => { :token => @token })
+    resp = Net::HTTP.post_form @uri + cmd_name, 'params' => params,
+                                                'output' => 'json',
+                                                '__conduit__' => true
+    body = JSON.parse resp.body, :symbolize_names => true
+    if body[:result].nil? then
+      raise Conduit::Error, "#{body[:error_code]}: #{body[:error_info]}"
+    end
+    body[:result]
+  end
+
+  attr_accessor :repository
+end
+
+module Detail
+  @@bug_cache = {}
+  def self.bug(commit)
+    match = commit.summary.match(/bug\s*([0-9]+)/i)
+    return nil if match.nil?
+
+    @@bug_cache[match[1]] ||= begin
+      url = BUGZILLA + "rest/bug/#{match[1]}?include_fields=id,summary,status"
+      resp = JSON.parse Net::HTTP.get(url), :symbolize_names => true
+      raise "#{resp[:message]}" if resp[:error]
+      resp[:bugs].first
+    end
+  end
+
+  @@revision_cache = {}
+  def self.revision(commit)
+    match = commit.message.match /differential\s+revision:\s*(?:.+\/)?D([0-9]+)/i
+    return nil if match.nil?
+
+    @@revision_cache[match[1]] ||= begin
+      resp = $conduit.differential.revision.search!(
+        :constraints => { :ids => [match[1].to_i] },
+        :attachments => { :reviewers => true })
+      raise "No such revision #{match[1]}" if resp[:data].empty?
+      resp[:data].first
+    end
+  end
+
+  @@reviewer_cache = {}
+  def self.reviewers(commit)
+    get_rev = -> name {
+      resp = $conduit.user.search! :constraints => { :usernames => [name] }
+      return resp[:data].first if !resp[:data].empty?
+      resp = $conduit.project.search! :constraints => { :slugs => [name] }
+      return resp[:data].first if !resp[:data].empty?
+      raise "unknown reviewer #{name}"
+    }
+
+    commit.summary.scan(/r(?:[?=,][^,\s]+)+/).collect_concat do |group|
+      group[2..-1].split(/[?=,]/).collect do |name|
+        @@reviewer_cache[name] ||= get_rev.(name)
+      end
+    end
+  end
+
+  @@git2hg = {}
+  def self.ensure_remote_hashes(commits)
+    if $remote_vcs != :hg then
+      return
+    end
+
+    # Get the range of commits which need hashes
+    all = commit_range(commits.first.parents[0]) {|commit|
+      !(`git cinnabar git2hg #{commit.oid}` =~ /0{40}/)
+    }
+    all.concat commits
+
+    # Get the hg ID of our base commit, and record it.
+    base_oid = all.first.parents[0].oid
+    @@git2hg[base_oid] = `git cinnabar git2hg #{base_oid}`.strip
+
+    # Create the bundle & parse hashes from it
+    Dir.mktmpdir do |dir|
+      bundle = "#{dir}/bundle"
+      range = "#{base_oid}..#{all.last.oid}"
+      system('git', 'cinnabar', 'bundle', '--version', '1', bundle, range)
+
+      open(bundle, 'rb') do |io|
+        raise 'bad bundle type' if io.read(6) != 'HG10UN'
+        all.each do |commit|
+          # Read our header (size = 84), and seek past the body.
+          body_size = io.read(4).unpack('N')[0] - 84
+          raise 'bad bundle entry' if body_size < 0
+
+          node, p1, p2, changeset = io.read(80).unpack('H40H40H40H40')
+          io.seek(body_size, IO::SEEK_CUR)
+
+          # Check our parent chain is sane
+          parent = @@git2hg[commit.parents[0].oid]
+          raise 'bad bundle parent' if parent != p1
+
+          # Record the mapping
+          @@git2hg[commit.oid] = node
+        end
+      end
+    end
+  end
+
+  def self.remote_rev(commit)
+    if $remote_vcs == :hg then
+      @@git2hg[commit.oid]
+    else
+      commit.oid
+    end
+  end
+
+  TYPE_ADD    = 1
+  TYPE_CHANGE = 2
+  TYPE_DELETE = 3
+
+  FILE_TEXT = 1
+  FILE_BINARY = 3
+
+  def self.diff(commit)
+    diff = commit.parents[0].tree.diff commit.tree, :context_lines => 32767
+
+    upload = []
+    changes = []
+    diff.each do |patch|
+      delta = patch.delta
+      type = case delta.status
+      when :added    then TYPE_ADD
+      when :modified then TYPE_CHANGE
+      when :deleted  then TYPE_DELETE
+      else raise "unhandled status #{delta.status}"
+      end
+
+      metadata = {}
+      change = {
+        :metadata => metadata,
+        :oldProperties => {},
+        :newProperties => {},
+        :oldPath => delta.old_file[:path],
+        :currentPath => delta.new_file[:path],
+        :addLines => patch.additions,
+        :delLines => patch.deletions,
+        :isMissingNewNewline => false,
+        :isMissingOldNewline => false,
+        :type => type,
+        :fileType => delta.binary? ? FILE_BINARY : FILE_TEXT,
+        :hunks => [],
+      }
+      changes << change
+
+      if !delta.added? then
+        change[:oldProperties]['unix:filemode'] =
+          delta.old_file[:mode].to_s(8)
+      end
+      if !delta.deleted? then
+        change[:newProperties]['unix:filemode'] =
+          delta.new_file[:mode].to_s(8)
+      end
+
+      patch.each do |hunk|
+        corpus = hunk.lines.map do |line|
+          case line.line_origin
+          when :context  then " #{line.content}"
+          when :addition then "+#{line.content}"
+          when :deletion then "-#{line.content}"
+          when :eof_newline_added then
+            change[:isMissingOldNewline] = true
+            '\ No newline at end of file'
+          when :eof_newline_removed then
+            change[:isMissingNewNewline] = true
+            '\ No newline at end of file'
+          when :eof_no_newline then
+            change[:isMissingOldNewline] = true
+            change[:isMissingNewNewline] = true
+            '\ No newline at end of file'
+          else raise "bad line_origin #{line.line_origin}"
+          end
+        end
+        change[:hunks] << {
+          :oldOffset => hunk.old_start,
+          :oldLength => hunk.old_lines,
+          :newOffset => hunk.new_start,
+          :newLength => hunk.new_lines,
+          :corpus => corpus.join(''),
+        }
+      end
+
+      # If the file is binary, mark it to be uploaded.
+      if delta.binary? then
+        if !delta.added? then
+          upload << {
+            :type => 'old',
+            :blob => $repo.lookup(delta.old_file[:oid]),
+            :metadata => metadata,
+          }
+        end
+
+        if !delta.deleted? then
+          upload << {
+            :type => 'new',
+            :blob => $repo.lookup(delta.new_file[:oid]),
+            :metadata => metadata,
+          }
+        end
+      end
+    end
+
+    # Conduit |creatediff| endpoint parameters
+    diff_init = {
+      :changes => changes,
+      :sourceControlSystem => $remote_vcs,
+      :sourceControlPath => '/',
+      :sourceControlBaseRevision => Detail.remote_rev(commit.parents[0]),
+      :creationMethod => 'phlay',
+      :lintStatus => 'none',
+      :unitStatus => 'none',
+      :repositoryPHID => $conduit.repository[:phid],
+
+      # This seems like unnecessarially invasive info to send, and I don't know
+      # of a use for it. Let's send some hardcoded values.
+      :sourceMachine => 'localhost',
+      :sourcePath => '/',
+      :branch => 'master',
+    }
+
+    # |local:commits| property for diff
+    diff_commits = {
+      Detail.remote_rev(commit) => {
+        :author => commit.author[:name],
+        :authorEmail =>  commit.author[:email],
+        :time => commit.author[:time].strftime('%s %z'),
+      }
+    }
+
+    # Diff summary
+    { :init => diff_init, :commits => diff_commits, :upload => upload }
+  end
+end
+
+
+# Get a range of commits starting at `start`, and ending the commit before the
+# predicate block returns `true`. Each commit must have exactly 1 parent.
+def commit_range(start)
+  commits = []
+  current = start
+  while !yield current
+    commits << current
+    raise 'cannot handle merge commits' if current.parents.length > 1
+    current = current.parents.first
+  end
+  commits.reverse!
+  return commits
+end
+
+def main()
+  args = Docopt::docopt $doc
+  if args["--version"] then
+    puts $version
+    return
+  end
+
+  # Discover our repository root
+  $repo = Rugged::Repository.discover()
+  $conduit = Conduit.new $repo
+
+  # Check the type of repository being used
+  $remote_vcs = $repo.ref('refs/cinnabar/metadata') ? :hg : :git
+
+  # XXX(nika): Allow selecting arbitrary refs.
+  head = $repo.rev_parse('HEAD')
+
+  # Get the set of commits we're interested in
+  if args["<commit>"].include? '..' then
+    base, tip = args["<commit>"].split('..', 2).map {|s| $repo.rev_parse(s)}
+    commits = commit_range(tip) {|p| p == base}
+  else
+    commits = [$repo.rev_parse(args["<commit>"])]
+  end
+
+  # Validate that our commit ranges look sane
+  raise 'no commits in range' if commits.empty?
+  after = commit_range(head) {|p| p == commits.last}
+
+  # If we need mercurial hashes, get them now
+  Detail.ensure_remote_hashes commits
+
+  commits.each {|c|
+    pp Detail.diff(c)[:commits]
+    pp Detail.bug c
+    pp Detail.revision c
+    pp Detail.reviewers c
+  }
+end
+
+if __FILE__ == $0
+  begin
+    main()
+  rescue Docopt::Exit => e
+    puts e.message
+  end
+end
