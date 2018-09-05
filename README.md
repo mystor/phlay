@@ -6,12 +6,17 @@ a hacky tool for people using git for their Mozilla development, which rewrites
 git history, and pushes individual commits as revisions, with the correct bug
 number, reviewers, and dependencies.
 
-This tool is a single-file ruby script, built on libgit2, which directly talks
-to the Conduit API. It aims to be feature complete, and handles complex tasks,
-such as diff parsing and metadata collection, locally.
+## Install
 
-> **NOTE** This tool declares dependencies using `bundler/inline`
+To install, symlink `phlay` from this directory onto your `$PATH`.
 
-> **NOTE** This file used to be a single-file python script, but as complexity
-> grew, the need for dependencies became too much. The implementation was
-> replaced with a ruby one to take advantage of `Rugged` and `bundler/inline`.
+```
+$ ln -s $PWD/phlay $HOME/.local/bin/phlay
+```
+
+## Dependencies
+
+This program depends on a few programs being installed:
+ - `ruby` is used for the core of the script
+ - `git-cinnabar` is required for cinnabar-based repositories
+ - `bundler` is used to install other dependencies from `Gemfile`
