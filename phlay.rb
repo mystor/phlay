@@ -123,11 +123,12 @@ class Meta
     Meta.init_git2hg commits if $remote_vcs == :hg
 
     # Wrap each commit into a meta object
-    commits.collect {|c| Meta.new c}
+    cur = nil
+    commits.collect {|c| cur = Meta.new c, cur}
   end
 
   # Create a single mercurial commit
-  def initialize(commit, parent: nil)
+  def initialize(commit, parent)
     @commit = commit
     @parent = parent
     @transactions = []
@@ -170,7 +171,7 @@ class Meta
     @new_summary = newlines.to_a.join('').strip
 
     # If we have a revision, extract depends on information from it.
-    dep_re = /depends\s+on\s+D([0-9])+/i
+    dep_re = /depends\s+on\s+D([0-9]+)/i
     if !@revision.nil?
       oldlines = @revision[:fields][:summary].lines.select {|s| !(s =~ dep_re)}
       @old_summary = oldlines.to_a.join('').strip
@@ -264,9 +265,9 @@ class Meta
 
       # Emit warnings if we try to change our dependency graph.
       if !@old_depend.nil?
-        if parent.nil?
+        if @parent.nil?
           warnings << "current parent D#{@old_depend} not in push"
-        elsif parent.revision.nil? || @old_depend != parent.revision[:id]
+        elsif @parent.revision.nil? || @old_depend != @parent.revision[:id]
           warnings << "can't change revision D#{@revision[:id]} dependency"
         end
       end
@@ -525,7 +526,9 @@ def main()
 
   # Get the set of commits we're interested in
   if args["<commit>"].include? '..'
-    base, tip = args["<commit>"].split('..', 2).map {|s| $repo.rev_parse(s)}
+    base, tip = args["<commit>"].split('..', 2).map {|s|
+      s.empty? ? head : $repo.rev_parse(s)
+    }
     commits = commit_range(tip) {|p| p == base}
   else
     commits = [$repo.rev_parse(args["<commit>"])]

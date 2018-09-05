@@ -3,10 +3,12 @@
 # Locate the source file
 SOURCE="${BASH_SOURCE[0]}"
 while [[ -h "$SOURCE" ]]; do SOURCE=$(readlink "$SOURCE"); done
-cd $(dirname "$SOURCE")
+# cd $(dirname "$SOURCE")
+PHLAYDIR=$(dirname "$SOURCE")
 
 # Confirm bundler is installed
 if ! hash bundle; then echo 'ruby-bundler not on $PATH' >&2; exit 1; fi
 
 # Run the actual ruby command
-exec bundle exec ruby ./phlay.rb "$@"
+export BUNDLE_GEMFILE="$PHLAYDIR/Gemfile"
+exec bundle exec ruby "$PHLAYDIR/phlay.rb" "$@"
