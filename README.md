@@ -6,13 +6,17 @@ a hacky tool for people using git for their Mozilla development, which rewrites
 git history, and pushes individual commits as revisions, with the correct bug
 number, reviewers, and dependencies.
 
-This tool is a single-file dependency free python script, which directly talks 
-to the Conduit API. Unfortunately, it currently lacks some features supported 
-by Arcanist (such as specifying the commit sha1 of base commits) due to 
-limitations in the `differential.createrawdiff` endpoint.
+## Install
 
-> **NOTE** This tool depends on `python >= 3.6`
+To install, symlink `phlay` from this directory onto your `$PATH`.
 
-> **NOTE** This is a hacky tool made for my own use, probably don't depend on 
-> it unless you're OK with it breaking.
+```
+$ ln -s $PWD/phlay $HOME/.local/bin/phlay
+```
 
+## Dependencies
+
+This program depends on a few programs being installed:
+ - `ruby` is used for the core of the script
+ - `git-cinnabar` is required for cinnabar-based repositories
+ - `bundler` is used to install other dependencies from `Gemfile`
