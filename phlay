@@ -1,871 +1,638 @@
-#!/usr/bin/env python3
+#!/usr/bin/env ruby
 
-from http.client import HTTPSConnection
-from urllib.parse import urlencode, urlparse
-from subprocess import check_output, check_call, CalledProcessError
-from argparse import ArgumentParser
-from tempfile import TemporaryDirectory
-from pathlib import Path
-import sys
-import os
-import re
-import json
-import curses
-import base64
-import socket
+require 'bundler/inline'
+gemfile do
+  source 'https://rubygems.org'
+  gem 'rugged'
+  gem 'docopt'
+  gem 'colorize'
+end
 
-
-NULL_SHA1 = '0' * 40
+require 'net/http'
+require 'base64'
+require 'tmpdir'
+require 'json'
+require 'pp'
 
 
-class Style:
-    """ANSI color helper"""
-    COLORS = 'black blue cyan green magenta red white yellow'.split()
-    SUGAR = dict(reset='sgr0', italic='sitm')
+BUGZILLA = URI "https://bugzilla.mozilla.org"
 
-    def __init__(self, color, stream=sys.stdout):
-        self.styled = color == 'always' or (color == 'auto' and stream.isatty())
-        if self.styled:
-            curses.setupterm()
-            self._setf = curses.tigetstr('setaf') or curses.tigetstr('setf')
+$version = "phray 0.1.0"
+$doc = <<DOCOPT
+Phray your commits onto phabricator
 
-    def __getattr__(self, name):
-        if not self.styled:
-            return ''
-        name = self.SUGAR.get(name, name)
-        if name in self.COLORS:
-            num = getattr(curses, 'COLOR_' + name.upper())
-            return curses.tparm(self._setf, num).decode('latin1')
-        return curses.tparm(curses.tigetstr(name)).decode('latin1')
+Usage:
+  #{__FILE__} [-y] <commit>
+  #{__FILE__} -h | --help
+  #{__FILE__} --version
 
+Options:
+  -y, --yes   Assume yes.
+  -h, --help  Print help info.
+  --version   Print the current version
+DOCOPT
 
-class UserError(Exception):
-    pass
+# Simple Conduit API endpoint. Provides only the minimal required API surface
+class Conduit
+  class Error < StandardError; end
+  class Category; end
 
+  def initialize(repo)
+    # Read configuration files for conduit
+    arcconfig = JSON.load Pathname(repo.workdir) + '.arcconfig'
 
-class Conduit:
-    def __init__(self, arcrc_path):
-        # Load the global and local Arcanist configuration
-        self.top = Path(check_output(['git', 'rev-parse', '--show-toplevel'])
-                        .decode().strip())
-        with open(self.top / '.arcconfig') as f:
-            arcconfig = json.load(f)
-        with open(Path(arcrc_path).expanduser()) as f:
-            arcrc = json.load(f)
+    arcrc_path = Pathname('~/.arcrc').expand_path
+    begin
+      arcrc = JSON.load arcrc_path
+    rescue IOError, Errno::ENOENT
+      arcrc = {}
+    end
 
-        # Load the URL from the local arcconfig
-        self.url = urlparse(arcconfig['phabricator.uri'])
-        if self.url.scheme != 'https':
-            raise UserError('Only HTTPS scheme phabricator.uri are supported')
+    # Read the URI from configuration, and get the related token
+    @uri = URI.join arcconfig["phabricator.uri"], 'api/'
+    @token = arcrc.dig('hosts', @uri.to_s, 'token')
 
-        # Find our authentication token
-        try:
-            self.token = next(data['token'] for url, data in arcrc['hosts'].items()
-                              if urlparse(url).netloc == self.url.netloc)
-        except:
-            raise UserError(f'No token for host {self.url.netloc}')
+    # Prompt the user to log in if no token is present
+    if @token.nil?
+      puts "LOGIN TO PHABRICATOR".bold
+      puts "Open this page in your browser, and login if necessary:"
+      puts @uri + '/conduit/login'
+      puts
 
-        # Connect to Conduit to determine our repository's PHID
-        self.callsign = arcconfig['repository.callsign']
-        self.repository = self.search_one('diffusion.repository', {
-            'callsigns': [arcconfig['repository.callsign']]
-        })
+      print "Paste API Token from that page: "
+      @token = STDIN.gets.strip
+      if @token.length != 32 || !(@token =~ /^cli-/)
+        raise 'The token was invalid or not formatted correctly'
+      end
+      arcrc['hosts'] ||= {}
+      arcrc['hosts'][@uri.to_s] ||= {}
+      arcrc['hosts'][@uri.to_s]['token'] = @token
+      arcrc_path.write JSON.pretty_generate(arcrc)
+    end
 
-        self.user = self.do('user.whoami')
-        self.hostname = socket.gethostname()
+    # use metaprogramming to define conduit methods on our object.
+    self.do('conduit.query').each do |cmd, spec|
+      cmd = cmd.to_s
+      *segs, method = cmd.split '.'
 
-    def do(self, cmd_name, **params):
-        # Add the token & write out parameters.
-        params['__conduit__'] = { 'token': self.token }
-        body = urlencode({
-            'params': json.dumps(params),
-            'output': 'json',
-            '__conduit__': True,
-        })
+      current = self
+      segs.each do |seg|
+        seg = seg.to_sym
+        if !current.respond_to? seg
+          cat = Category.new
+          current.define_singleton_method(seg) { cat }
+        end
+        current = current.public_send seg
+      end
 
-        # Send the POST request
-        conn = HTTPSConnection(self.url.netloc)
-        conn.request("POST", f'/api/{cmd_name}', body=body)
+      # Define the final endpoint method, taking the argument list.
+      this = self
+      current.define_singleton_method("#{method}!".to_sym) do |args = {}|
+        args.keys { |k| raise "bad #{k}" if !spec[:params].include? k }
+        this.do cmd, args
+      end
+    end
 
-        # Read the response as JSON
-        resp = json.load(conn.getresponse())
-        if resp['error_code'] is not None:
-            raise UserError(f"conduit[{resp['error_code']}]: {resp['error_info']}")
-        return resp['result']
+    # Determine repository from our callsign
+    resp = diffusion.repository.search! :constraints => {
+      :callsigns => [arcconfig['repository.callsign']]
+    }
+    @repository = resp[:data][0]
+  end
 
-    def search_one(self, what, constraints, attachments={}):
-        resp = self.do(f'{what}.search',
-                       constraints=constraints,
-                       attachments=attachments,
-                       limit=1)
-        if len(resp['data']) != 1:
-            raise UserError(f'cannot find {what} (constraints={constraints})')
-        return resp['data'][0]
+  # Run a single command on the conduit remote
+  def do(cmd_name, args = {})
+    params = JSON.dump args.merge(:__conduit__ => { :token => @token })
+    resp = Net::HTTP.post_form @uri + cmd_name, 'params' => params,
+                                                'output' => 'json',
+                                                '__conduit__' => true
+    body = JSON.parse resp.body, :symbolize_names => true
+    if !body[:error_code].nil?
+      raise Conduit::Error, "#{body[:error_code]}: #{body[:error_info]}"
+    end
+    body[:result]
+  end
 
+  attr_accessor :repository
+  attr_accessor :uri
+end
 
-class Hunk:
-    def __init__(self, a_offset, a_length, b_offset, b_length):
-        self.a_offset = a_offset
-        self.a_length = a_length
-        self.b_offset = b_offset
-        self.b_length = b_length
-        self.corpus = []
+class Meta
+  @@bug_cache = {}
+  @@revision_cache = {}
+  @@reviewer_cache = {}
+  @@git2hg = {}
 
-    def to_conduit(self, _conduit):
-        return {
-            'oldOffset': self.a_offset,
-            'oldLength': self.a_length,
-            'newOffset': self.b_offset,
-            'newLength': self.b_length,
-            'corpus': '\n'.join(self.corpus),
+  # Fetch Meta for a series of commits. Should be in |commit_range| order.
+  def self.fetch(commits)
+    # Make sure we have our remote hashes
+    Meta.init_git2hg commits if $remote_vcs == :hg
+
+    # Wrap each commit into a meta object
+    commits.collect {|c| Meta.new c}
+  end
+
+  # Create a single mercurial commit
+  def initialize(commit, parent: nil)
+    @commit = commit
+    @parent = parent
+    @transactions = []
+    @details = ""
+
+    # Get our mercurial hash if we have one, as well as our parent's
+    if $remote_vcs == :hg
+      @remote_hash = @@git2hg[@commit.oid]
+      @base_hash = @@git2hg[@commit.parents[0].oid]
+    else
+      @remote_hash = @commit.oid
+      @base_hash = @commit.parents[0].oid
+    end
+
+    # Bug info
+    @bug = if m = @commit.summary.match(/bug\s*([0-9]+)/i)
+      @@bug_cache[m[1]] ||= begin
+        url = BUGZILLA + "rest/bug/#{m[1]}?include_fields=id,summary,status"
+        resp = JSON.parse Net::HTTP.get(url), :symbolize_names => true
+        raise "#{resp[:message]}" if resp[:error]
+        resp[:bugs].first
+      end
+    end
+
+    # Revision info
+    revision_re = /differential\s+revision:\s*(?:.+\/)?D([0-9]+)/i
+    @revision = if m = @commit.message.match(revision_re)
+      @@revision_cache[m[1]] ||= begin
+        resp = $conduit.differential.revision.search!(
+          :constraints => { :ids => [m[1].to_i] },
+          :attachments => { :reviewers => true })
+        raise "No such revision #{m[1]}" if resp[:data].empty?
+        resp[:data].first
+      end
+    end
+
+    # Determine the revision summary we are going to use. This also skips the
+    # first line of the commit message.
+    newlines = @commit.message.lines.drop(1).select {|s| !(s =~ revision_re)}
+    @new_summary = newlines.to_a.join('').strip
+
+    # If we have a revision, extract depends on information from it.
+    dep_re = /depends\s+on\s+D([0-9])+/i
+    if !@revision.nil?
+      oldlines = @revision[:fields][:summary].lines.select {|s| !(s =~ dep_re)}
+      @old_summary = oldlines.to_a.join('').strip
+
+      if m = @revision[:fields][:summary].match(dep_re)
+        @old_depend = m[1].to_i
+      end
+    end
+
+    # Reviewer info
+    reviewer = -> name {
+      resp = $conduit.user.search! :constraints => { :usernames => [name] }
+      return resp[:data].first if !resp[:data].empty?
+      resp = $conduit.project.search! :constraints => { :slugs => [name] }
+      return resp[:data].first if !resp[:data].empty?
+      raise "unknown reviewer #{name}"
+    }
+    reviewer_re = /r(?:[?=,][^,\s]+)+/
+    @reviewers = @commit.summary.scan(reviewer_re).collect_concat {|g|
+      g[2..-1].split(/[?=,]/).collect {|name|
+        @@reviewer_cache[name] ||= reviewer.(name)
+      }
+    }
+
+    # Strip any reviewer information from the title to put on phabricator.
+    @new_title = @commit.summary.sub(reviewer_re, '')
+    @new_title.sub!(/[\s,.;]*$/, '')
+
+    # Phabricator commit descriptor
+    @phab_commits = {
+      @remote_hash => {
+        :author => @commit.author[:name],
+        :authorEmail =>  @commit.author[:email],
+        :time => @commit.author[:time].strftime('%s %z'),
+      }
+    }
+
+    # Generate the diff
+    generate_diff
+  end
+
+  def list_details
+    warnings = []
+
+    # Log this revision's details to the user while we determine changes
+    # XXX(nika): Should we do this in a separate method?
+    puts
+    puts "#{@commit.oid[0, 12].yellow} #{@commit.summary}"
+    if $remote_vcs == :hg
+      label "Hg Changeset", "#{@remote_hash.yellow} (parent=#{@base_hash[0, 12]})"
+    end
+
+    # Are we updating or creating a new revision?
+    if @revision.nil?
+      update :repositoryPHID, $conduit.repository[:phid]
+      label "New Revision", "<repo: #{$conduit.repository[:fields][:name]}>"
+    else
+      label "Update Rev.", $conduit.uri + "/D#{@revision[:id]}"
+    end
+
+    # What changes are we going to be making?
+    files, additions, deletions = @git_diff.stat
+    label "Changes", "#{files} file(s) (+#{additions}, -#{deletions})".bold
+    if !@uploads.empty?
+      label "Upload", "#{@uploads.length} binaries"
+    end
+
+    if @revision.nil?
+      # Details for newly created revision
+      update :title, @new_title
+      label "Title", @new_title
+
+      update :summary, @new_summary
+      if !@new_summary.empty?
+        label "Summary", ''
+        @new_summary.each_line {|line| puts "    #{line}"}
+      end
+
+      if @bug.nil?
+        warnings << "no bug # specified"
+      else
+        update :'bugzilla.bug-id', @bug[:id].to_s
+        label "Bug", "Bug #{@bug[:id]} [#{@bug[:status].bold}] #{@bug[:summary]}"
+      end
+    else
+      # Are we updating the revision title?
+      if @new_title != @revision[:fields][:title]
+        update :title, @new_title
+        label "New Title", @new_title
+      end
+
+      # Emit warnings if we try to change our dependency graph.
+      if !@old_depend.nil?
+        if parent.nil?
+          warnings << "current parent D#{@old_depend} not in push"
+        elsif parent.revision.nil? || @old_depend != parent.revision[:id]
+          warnings << "can't change revision D#{@revision[:id]} dependency"
+        end
+      end
+
+      # If our summary was updated, add a transaction to make the change.
+      if @old_summary != @new_summary
+        update :summary, @new_summary
+        label "New Summary", ''
+        @new_summary.each_line {|line| puts "    #{line}"}
+      end
+
+      # Emit a warning if the bug number for the revision is mismatched.
+      other_bug = @revision[:fields][:'bugzilla.bug-id']
+      if other_bug != @bug[:id].to_s
+        warnings << "bug mismatch (#{@bug[:id]} != #{other_bug})"
+      end
+    end
+
+    # Add any new reviewers which are not yet mentioned.
+    if @revision.nil?
+      to_add = @reviewers
+    else
+      existing_details = @revision[:attachments][:reviewers][:reviewers]
+      existing = existing_details.collect{|r| r[:reviewerPHID]}
+      to_add = @reviewers.select{|r| !existing.include? r[:phid]}
+    end
+
+    if !to_add.empty?
+      # XXX(nika): Mark these reviewers as "blocking"
+      update :'reviewers.add', to_add.collect{|r| r[:phid]}
+      label "Add Reviewer", to_add.collect{|r|
+        if r[:type] == "USER"
+          "#{r[:fields][:realName]} [:#{r[:fields][:username]}]"
+        else
+          "#{r[:fields][:name]}"
+        end
+      }.join(', ')
+    elsif @revision.nil?
+      warnings << "no reviewers specified"
+    end
+
+    # Print any generated warnings
+    warnings.each {|warning|
+      puts "  #{'warning'.red}: #{warning.yellow}"
+    }
+  end
+
+  def label(tag, details)
+    puts "  #{tag.ljust(12).cyan.bold} #{details}"
+  end
+
+  def update(type, value)
+    @transactions << { :type => type, :value => value }
+  end
+
+  attr_reader :remote_hash
+  attr_reader :phab_commits
+  attr_reader :reviewers
+  attr_reader :revision
+  attr_reader :bug
+  attr_reader :diff
+  attr_reader :uploads
+  attr_reader :new_title
+  attr_reader :new_summary
+  attr_reader :transactions
+  attr_reader :commit
+
+  # Phabricator change type constants
+  TYPE_ADD    = 1
+  TYPE_CHANGE = 2
+  TYPE_DELETE = 3
+
+  # Phabricator file type constants
+  FILE_TEXT   = 1
+  FILE_BINARY = 3
+
+  private def generate_diff
+    # Get the diff between our parent's tree and our tree
+    @git_diff = @commit.parents[0].tree.diff @commit.tree, :context_lines => 32767
+
+    changes = []
+    @uploads = []
+    @git_diff.each do |patch|
+      delta = patch.delta
+      type = case delta.status
+      when :added    then TYPE_ADD
+      when :modified then TYPE_CHANGE
+      when :deleted  then TYPE_DELETE
+      else raise "unhandled status #{delta.status}"
+      end
+
+      metadata = {}
+      change = {
+        :metadata => metadata,
+        :oldProperties => {},
+        :newProperties => {},
+        :oldPath => delta.old_file[:path],
+        :currentPath => delta.new_file[:path],
+        :addLines => patch.additions,
+        :delLines => patch.deletions,
+        :isMissingNewNewline => false,
+        :isMissingOldNewline => false,
+        :type => type,
+        :fileType => delta.binary? ? FILE_BINARY : FILE_TEXT,
+        :hunks => [],
+      }
+      changes << change
+
+      if !delta.added?
+        change[:oldProperties]['unix:filemode'] =
+          delta.old_file[:mode].to_s(8)
+      end
+      if !delta.deleted?
+        change[:newProperties]['unix:filemode'] =
+          delta.new_file[:mode].to_s(8)
+      end
+
+      patch.each do |hunk|
+        corpus = hunk.lines.map do |line|
+          case line.line_origin
+          when :context  then " #{line.content}"
+          when :addition then "+#{line.content}"
+          when :deletion then "-#{line.content}"
+          when :eof_newline_added then
+            change[:isMissingOldNewline] = true
+            '\ No newline at end of file'
+          when :eof_newline_removed then
+            change[:isMissingNewNewline] = true
+            '\ No newline at end of file'
+          when :eof_no_newline then
+            change[:isMissingOldNewline] = true
+            change[:isMissingNewNewline] = true
+            '\ No newline at end of file'
+          else raise "bad line_origin #{line.line_origin}"
+          end
+        end
+        change[:hunks] << {
+          :oldOffset => hunk.old_start,
+          :oldLength => hunk.old_lines,
+          :newOffset => hunk.new_start,
+          :newLength => hunk.new_lines,
+          :corpus => corpus.join(''),
         }
-
-
-class Change:
-    """Individual file change as part of a changeset"""
-    # I just love magic numbers~!
-    TYPE_ADD        = 1
-    TYPE_CHANGE     = 2
-    TYPE_DELETE     = 3
-
-    # XXX(nika): Add support for moves/copies
-    TYPE_MOVE_AWAY  = 4
-    TYPE_COPY_AWAY  = 5
-    TYPE_MOVE_HERE  = 6
-    TYPE_COPY_HERE  = 7
-    TYPE_MULTICOPY  = 8
-
-    FILE_TEXT       = 1
-    FILE_IMAGE      = 2
-    FILE_BINARY     = 3
-    FILE_DIRECTORY  = 4
-    FILE_SYMLINK    = 5
-    FILE_DELETED    = 6
-    FILE_NORMAL     = 7
-
-    def __init__(self, a_mode, b_mode, a_sha, b_sha, kind, a_path, b_path):
-        self.a_mode = a_mode
-        self.b_mode = b_mode
-        self.a_blob = Blob(a_sha)
-        self.b_blob = Blob(b_sha)
-        self.kind = kind
-        self.a_path = a_path
-        self.b_path = b_path
-
-        # Information about diff state
-        self.hunks = []
-        self.added = 0
-        self.removed = 0
-        self.binary = False
-
-    def to_conduit(self, conduit):
-        # Upload binary blobs if necessary.
-        metadata = {}
-        if self.binary and self.b_blob.body() is not None:
-            data_base64 = base64.standard_b64encode(self.b_blob.body()).decode()
-            binary_phid = conduit.do('file.upload', data_base64=data_base64)
-            metadata = {
-                'old:file-size': len(self.a_blob.body()),
-                'new:file-size': len(self.b_blob.body()),
-                'new:binary-phid': binary_phid,
-                # XXX(nika): Guess mime type?
-            }
-
-        old_props = { 'unix:filemode': self.a_mode } if self.a_path else {}
-        new_props = { 'unix:filemode': self.b_mode } if self.b_path else {}
-
-        return {
-            'metadata': metadata,
-            'oldProperties': old_props,
-            'newProperties': new_props,
-            'oldPath': self.a_path,
-            'currentPath': self.b_path,
-            'addLines': self.added,
-            'delLines': self.removed,
-            'type': self.kind,
-            'fileType': self.FILE_BINARY if self.binary else self.FILE_TEXT,
-            'hunks': [hunk.to_conduit(conduit) for hunk in self.hunks],
-        }
-
-
-class Diff:
-    """simple diff parser"""
-    def __init__(self, commit):
-        self.commit = commit
-        self.changes = []
-
-        hash_to_changes = {}
-
-        # Get a combined raw & patch diff from git diff-tree. The sections will
-        # be separated by '\0\0'.
-        [raw, patch] = check_output([
-            'git', 'diff-tree', '-r',
-            '--no-ext-diff', '--no-textconv', '--no-color', # No customization
-            '--raw', '-z',        # Add easy-to-parse \0-separated header
-            '--patch', '-U32767', # Include all patch context
-            '--full-index',       # Don't abbreviate the index sha1s
-            commit.commit_hash
-        ]).decode().split('\0\0', maxsplit=1)
-
-        # Split the raw section on '\0:', the delimiter between raw changes
-        [junk, *raw_changes] = raw.split('\0:')
-        assert junk == commit.commit_hash, "unexpected junk leader!"
-        for change in raw_changes:
-            # '--raw -z' only uses '\0' to split paths, other sections are still
-            # space-separated.
-            [fields, a_path, *rest] = change.split('\0')
-            [a_mode, b_mode, a_hash, b_hash, kind] = fields.split(' ')
-
-            # Determine which paths we are working with.
-            b_path = a_path
-            if len(rest) == 1:
-                b_path = rest[0]
-
-            if kind[0] == 'A':
-                a_path = None
-                phk = Change.TYPE_ADD
-            elif kind[0] == 'D':
-                b_path = None
-                phk = Change.TYPE_DELETE
-            elif kind[0] == 'M':
-                phk = 0
-            else:
-                raise UserError(f"Unhandled change type {kind}")
-
-            # Create the change for this raw change.
-            change = Change(a_mode, b_mode, a_hash, b_hash, phk, a_path, b_path)
-
-            # Add the change to the list in question.
-            self.changes.append(change)
-            hash_to_changes[f"{a_hash}..{b_hash}"] = change
-
-        # Walk through lines in the patch. Reading an 'index' line will switch
-        # to a new diff entry.
-        active_change = None
-        active_hunk = None
-        a_hunk_remaining = 0
-        b_hunk_remaining = 0
-        for line in patch.splitlines():
-            # Check for entering a new entry's header
-            indexmatch = re.match(r'index ([a-f0-9]{40}..[a-f0-9]{40})', line, re.I)
-            if indexmatch:
-                active_change = hash_to_changes[indexmatch.group(1)]
-                continue
-            elif active_change is None:
-                continue
-
-            # Detect binary diffs
-            if line.startswith('Binary files'): # XXX(nika): more robust?
-                assert len(active_change.hunks) == 0, "binary files have no hunks"
-                active_change.binary = True
-            if active_change.binary:
-                continue
-
-            # Detect hunks
-            hunkmatch = re.match(r'@@ -(\d+),(\d+) \+(\d+),(\d+) @@', line, re.I)
-            if hunkmatch:
-                active_hunk = Hunk(int(hunkmatch.group(1)),
-                                   int(hunkmatch.group(2)),
-                                   int(hunkmatch.group(3)),
-                                   int(hunkmatch.group(4)))
-                active_change.hunks.append(active_hunk)
-
-                # Keep track of how many lines are remaining for each hunk.
-                a_hunk_remaining = active_hunk.a_length
-                b_hunk_remaining = active_hunk.b_length
-                continue
-            elif active_hunk is None:
-                continue
-
-            # Add additions, removals, and context to the current hunk.
-            if line[0] == '+':
-                assert b_hunk_remaining > 0
-                active_change.added += 1
-                b_hunk_remaining -= 1
-                active_hunk.corpus.append(line)
-
-            if line[0] == '-':
-                assert a_hunk_remaining > 0
-                active_change.removed += 1
-                a_hunk_remaining -= 1
-                active_hunk.corpus.append(line)
-
-            if line[0] == ' ':
-                a_hunk_remaining -= 1
-                b_hunk_remaining -= 1
-                active_hunk.corpus.append(line)
-
-            # If we've seen all of the lines for the current hunk, end it.
-            if a_hunk_remaining == 0 and b_hunk_remaining == 0:
-                active_hunk = None
-
-        self.added = sum(c.added for c in self.changes)
-        self.removed = sum(c.removed for c in self.changes)
-
-    def to_conduit(self, conduit):
-        changes = [ch.to_conduit(conduit) for ch in self.changes]
-        diff = conduit.do('differential.creatediff',
-                          changes=changes,
-                          sourceMachine=conduit.hostname,
-                          sourceControlSystem='hg',
-                          sourceControlPath='/',
-                          sourceControlBaseRevision=self.commit.parent().hg_hash,
-                          creationMethod='phlay',
-                          lintStatus='none',
-                          unitStatus='none',
-                          repositoryPHID=conduit.repository['phid'],
-                          sourcePath=str(conduit.top),
-                          # XXX(nika): This seems kinda irrelevant?
-                          branch='HEAD')
-
-        # Add information about local commits to the patch. This info is needed
-        # by lando.
-        conduit.do('differential.setdiffproperty',
-                   diff_id=diff['diffid'],
-                   name='local:commits',
-                   data=json.dumps({
-                       self.commit.hg_hash: {
-                           'author': self.commit.author_name,
-                           'authorEmail': self.commit.author_email,
-                           'time': int(self.commit.unix_date),
-                       }
-                   }))
-        return diff
-
-
-class Cached:
-    """single-instance cached object helper"""
-    def __new__(cls, *args, **kwargs):
-        if not hasattr(cls, '_cache'):
-            cls._cache = {}
-        key = cls.key(*args, **kwargs)
-        self = cls._cache.get(key, None)
-        if self is None:
-            self = super().__new__(cls)
-            cls._cache[key] = self
-            self.init(*args, **kwargs)
-        return self
-
-    @classmethod
-    def key(cls, *args):
-        return tuple(map(str, args))
-
-    def init(self):
-        pass
-
-
-class Revision(Cached):
-    _info = None
-
-    def init(self, revid):
-        self.revid = int(revid)
-
-    def info(self, conduit):
-        if self._info is None:
-            self._info = conduit.search_one('differential.revision', {
-                'ids': [self.revid]
-            }, attachments={ 'reviewers': True })
-        return self._info
-
-    def url(self, conduit):
-        return f"https://{conduit.url.netloc}/D{self.revid}"
-
-
-class Bug(Cached):
-    _info = None
-
-    def init(self, bugno):
-        self.bugno = int(bugno)
-
-    def info(self, _conduit):
-        if self._info is None:
-            conn = HTTPSConnection('bugzilla.mozilla.org')
-            conn.request('GET',
-                f"/rest/bug/{self.bugno}?include_fields=summary,status")
-            resp = json.load(conn.getresponse())
-            if resp.get('error', False):
-                raise UserError(resp['message'])
-            self._info = resp['bugs'][0]
-        return self._info
-
-
-class Reviewer(Cached):
-    _info = None
-
-    def init(self, tag):
-        self.tag = tag
-
-    def info(self, conduit):
-        if self._info is None:
-            try:
-                # First, we try to locate a user with the reviewer's name.
-                self._info = conduit.search_one('user', {
-                    'usernames': [self.tag]
-                })
-            except UserError:
-                try:
-                    # Then we locate a project based on its slug.
-                    self._info = conduit.search_one('project', {
-                        'slugs': [self.tag]
-                    })
-                except UserError:
-                    raise UserError(f"no such reviewer: {self.tag}")
-
-        return self._info
-
-
-class Blob(Cached):
-    _body = None
-
-    def init(self, hash):
-        self.hash = hash
-
-    def is_null(self):
-        return self.hash == NULL_SHA1
-
-    def body(self):
-        if self.is_null():
-            return None
-        if self._body is None:
-            self._body = check_output('git', 'cat-file', 'blob', self.hash)
-        return self._body
-
-
-class Commit(Cached):
-    # Fields pulled from 'git show'
-    abbrev          = '%h'
-    commit_hash     = '%H'
-    tree_hash       = '%T'
-    parent_hashes   = '%P'
-    author_name     = '%an'
-    author_email    = '%ae'
-    author_date     = '%aD'
-    unix_date       = '%at'
-    committer_name  = '%cn'
-    committer_email = '%ce'
-    committer_date  = '%cD'
-    subject         = '%s'
-    body            = '%b'
-    raw_body        = '%B'
-
-    @classmethod
-    def key(cls, rev):
-        if re.fullmatch(r'[a-f0-9]{40}', rev, re.I):
-            return rev  # If it looks like a full sha1, just return it
-        return check_output(['git', 'rev-parse', '--verify', rev]).decode().strip()
-
-    def init(self, rev):
-        self.transactions = []
-        self._diff = None
-
-        # Read information from 'git show'
-        FIELDS = { k: v for k, v in Commit.__dict__.items()
-                   if type(v) == str and v.startswith('%') }
-        FORMAT = '%x00'.join(FIELDS.values())
-
-        info = check_output(['git', 'show', '-q', f'--format={FORMAT}', rev])
-        self.__dict__.update(zip(FIELDS.keys(), info.decode().split('\0')))
-        self.parent_hashes = self.parent_hashes.split()
-
-        # Compute more info based on the commit message etc.
-        bugmatch = re.search(r'bug\s+(\d+)', self.subject, re.I)
-        self.bug = bugmatch and Bug(bugmatch.group(1))
-
-        # Parse the reviewer list
-        self.reviewers = []
-        for rmatch in re.finditer(r'r((?:[?=,][^,\s]+)+)', self.subject, re.I):
-            for name in re.split(r'[?=,]', rmatch.group(1))[1:]:
-                self.reviewers.append(Reviewer(name))
-
-        # Parse the revision out of body, and strip to store in summary.
-        self.revision = None
-        def rev_replace(match):
-            self.revision = Revision(match.group(2))
-            return ""
-        self._summary = re.sub(
-            r'^Differential\s+Revision:\s*(.*/)?D([0-9]+)$',
-            rev_replace, self.body, count=1, flags=re.I | re.M
-        ).strip()
-
-        # Check if this commit has a corresponding mercurial hash already
-        # computed and cached. If we don't, and we need it, we will compute it
-        # later in ensure_hg_hashes.
-        self.hg_hash = check_output([
-            'git', 'cinnabar', 'git2hg', self.commit_hash
-        ]).decode().strip()
-        if self.hg_hash == NULL_SHA1:
-            self.hg_hash = None
-
-        # We can /guess/ whether or not a commit is "public" (pushed to inbound)
-        # based on whether or not it has a cached hg_hash. non-"public" commits
-        # will have a null hg_hash, which is filled in during ensure_hg_hashes.
-        #
-        # Commits with revision IDs are also public.
-        self.is_public = self.hg_hash is not None or self.revision is not None
-
-    def parent(self):
-        if len(self.parent_hashes) == 1:
-            return Commit(self.parent_hashes[0])
-        return None
-
-    def get_diff(self):
-        if not self._diff:
-            self._diff = Diff(self)
-        return self._diff
-
-    def add_transaction(self, type, value):
-        self.transactions.append({
-            'type': type,
-            'value': value,
-        })
-
-    def summary(self, parent, pending_deps=False):
-        summary = self._summary
-
-        # If we have a valid parent revision, we can declare a dependency on it.
-        # If we're allowed to have pending dependencies (pending_deps is true),
-        # then we can declare a dependency on '<pending>'. Otherwise, we don't
-        # depend on anything.
-        if parent is not None:
-            if parent.revision:
-                summary += f"\n\nDepends on D{parent.revision.revid}"
-            elif pending_deps:
-                summary += f"\n\nDepends on D<pending>"
-
-        return summary.strip()
-
-    def recommit(self, parent, message):
-        message = message.strip()  # Make sure to clean up trailing whitespace
-        if parent == self.parent() and message == self.raw_body.strip():
-            return self
-
-        # Set up the commit environment
-        env = dict(os.environ)
-        env.update(GIT_AUTHOR_NAME=self.author_name,
-                   GIT_AUTHOR_EMAIL=self.author_email,
-                   GIT_AUTHOR_DATE=self.author_date,
-                   GIT_COMMITTER_NAME=self.committer_name,
-                   GIT_COMMITTER_EMAIL=self.committer_email,
-                   GIT_COMMITTER_DATE=self.committer_date)
-
-        newsha = check_output([
-            'git', 'commit-tree',
-            '-p', parent.commit_hash,
-            self.tree_hash
-        ], input=message.encode(), env=env).decode().strip()
-        return Commit(newsha)
-
-    def __repr__(self):
-        return f'<commit {self.abbrev} {repr(self.subject)}>'
-
-
-def ensure_hg_hashes(commits):
-    """Ensures that the range of commits 'commits' all has valid mercurial
-    hashes. |commits| must be sorted, with the oldest commit at index |0|."""
-
-    # Determine the set of commits which we will make into mercurial commits.
-    # Cinnabar will complain if our base commit's parent doesn't have a
-    # precomputed mercurial hash, so we have to climb until we find a commit
-    # which does.
-    to_hg = []
-    current = commits[0].parent()
-    while not (current and current.hg_hash):
-        if current is None:
-            raise UserError(f'no direct mercurial ancestor!')
-        to_hg.append(current)
-        current = current.parent()
-    to_hg.reverse()
-    to_hg += commits
-
-    # Map from mercurial parent commits to child commits.
-    hg_ptoc = {}
-
-    # Get cinnabar to export a bundle with the specified commits. This will
-    # determine the mercurial hashes for those commits. We then parse the v1
-    # bundle format to extract relevant sha1 values.
-    with TemporaryDirectory() as tmpdir:
-        path = os.path.join(tmpdir, 'bundle.hg')
-
-        # XXX(nika): This is probably the slowest part of phlay. Perhaps we could
-        # run it in parallel with the other network/io code (e.g. using asyncio)?
-        # We don't need the information until after you approve selected commits.
-        check_call(['git', 'cinnabar', 'bundle',
-                    '--version', '1', path,
-                    f"{current.commit_hash}..{to_hg[-1].commit_hash}"])
-
-        # The header of each chunk is 84 bytes long (4 bytes of length, 4x20
-        # bytes of sha1 hashes).
-        CHUNK_HEADER = 84
-
-        with open(path, 'rb') as f:
-            # Check the bundle type is an uncompressed v1 bundle.
-            assert f.read(6) == b'HG10UN', "bad bundle type"
-
-            while True:
-                # Read the size of the current section. A size too small to fit
-                # a header means we're done.
-                length = int.from_bytes(f.read(4), byteorder='big')
-                if length <= CHUNK_HEADER:
-                    break
-
-                # Read the header, containing 4x sha1 hashes, and skip the
-                # remaining data.
-                node = f.read(20).hex()
-                parent1 = f.read(20).hex()
-                parent2 = f.read(20).hex()
-                changeset = f.read(20).hex()
-                f.read(length - CHUNK_HEADER)
-
-                assert parent2 == NULL_SHA1, "Should have 1 parent"
-                assert changeset == node, "Changeset should match node"
-
-                # Stash the parent-to-child mapping
-                hg_ptoc[parent1] = node
-
-    # Apply the computed hg_ptoc map to add mercurial hashes
-    for commit in to_hg:
-        assert commit.parent().hg_hash is not None
-        commit.hg_hash = hg_ptoc[commit.parent().hg_hash]
-
-
-def get_revisions(args):
-    # Check our 'ref' argument
-    if args.ref != 'HEAD':
-        # Limit to '--heads' if no path is provided
-        heads = [] if '/' in args.ref else ['--heads']
-        lines = check_output(['git', 'show-ref', *heads, args.ref]) \
-            .decode().strip().splitlines()
-        if len(lines) != 1:
-            raise UserError(f'Ambiguous or Unknown ref: {args.ref}')
-        ref = lines[0].split()[1]
-    else:
-        ref = 'HEAD'
-
-    # Determine which commits to reparent vs. push
-    if '..' in args.revspec:
-        start, end = map(Commit, args.revspec.split('..', 1))
-    else:
-        end = Commit(args.revspec)
-        start = end.parent()
-
-    current = Commit(ref)
-    reparent = []
-    while current != end:
-        if current is None:
-            raise UserError(f'{end.abbrev} not direct ancestor of {ref}')
-        reparent.append(current)
-        current = current.parent()
-    reparent.reverse()
-
-    push = []
-    while current != start:
-        if current is None:
-            raise UserError(f'{start.abbrev} not direct ancestor of {end.abbrev}')
-        push.append(current)
-        current = current.parent()
-    push.reverse()
-
-    if len(push) == 0:
-        raise UserError('no commits specified')
-
-    return start, ref, push, reparent
-
-
-def process_args(args):
-    # Set up state for arguments
-    style = Style(args.color)
-    conduit = Conduit(args.arcrc)
-    start, ref, push, reparent = get_revisions(args)
-
-    # Stash the current sha1 for |ref|
-    initial_ref = Commit(ref)
-
-    # Ensure we have a mercurial hash for each commit we want to push.
-    ensure_hg_hashes(push)
-
-    # Define a helper for printing styled & labeled information to stdout.
-    def label(label, *rest, warn=False):
-        color = style.bold + (style.red if warn else style.cyan)
-        body = ' '.join(str(s) for s in rest)
-        if '\n' in body:
-            indent = '\n    '
-            body = body.replace('\n', indent)
-        else:
-            indent = ' ' * (14 - len(label))
-        print(f"  {color}{label}{style.reset}{indent}{body}")
-
-    # Validate that everything exists, and show computed info
-    for commit in push:
-        print(f"{style.yellow}{commit.abbrev}{style.reset} {commit.subject}")
-
-        # Produce an error if no bug # was specified
-        if commit.bug is None:
-            raise UserError(f"no bug # specified")
-
-        # Determine which commit we're going to depend on, respecting
-        # --no-extern-deps.
-        dep_parent = commit.parent()
-        if args.no_extern_deps and dep_parent is start:
-            dep_parent = None
-        elif not (dep_parent.is_public or dep_parent is not start):
-            print(f"{style.red}{style.bold}warning: parent not public",
-                  f"(no revid, not hg){style.reset}", file=sys.stderr)
-
-        # Determine which revision we're working with
-        if commit.revision is None:
-            revinfo = {}
-            label('Revision', '<<new>>')
-        else:
-            revinfo = commit.revision.info(conduit)
-            label('Revision', commit.revision.url(conduit))
-        revfields = revinfo.get('fields', {})
-
-        # Log computed mercurial hashes.
-        label('Mercurial', f"{commit.hg_hash}")
-
-        # Specify which repository we're working with
-        oldrepo = revfields.get('repositoryPHID')
-        if not oldrepo:
-            commit.add_transaction('repositoryPHID', conduit.repository['phid'])
-            label('Repository', conduit.repository['fields']['name'])
-        elif oldrepo != conduit.repository['phid']:
-            raise UserError('specified revision for incorrect repository!')
-
-        # Log computed information about the patch to be pushed
-        diff = commit.get_diff()
-        label('Changes',
-              f"{style.bold}{len(diff.changes)} files{style.reset}, "
-              f"{style.green}+{diff.added}{style.reset}, "
-              f"{style.red}-{diff.removed}{style.reset}")
-
-        # Title Updates
-        oldtitle = revfields.get('title')
-        if oldtitle != commit.subject:
-            commit.add_transaction('title', commit.subject)
-            label('Set Title', commit.subject)
-
-        # Summary Generation
-        oldsummary = revfields.get('summary')
-        summary = commit.summary(dep_parent, pending_deps=dep_parent is not start)
-        if oldsummary != summary:
-            commit.add_transaction('summary', summary)
-            label('Set Summary', summary)
-
-        # Update the Bug #
-        buginfo = commit.bug.info(conduit)
-        oldbugno = revfields.get('bugzilla.bug-id')
-        if oldbugno != str(commit.bug.bugno):
-            commit.add_transaction('bugzilla.bug-id', str(commit.bug.bugno))
-            label('Set Bug',
-                  f"Bug {commit.bug.bugno}",
-                  f"{style.bold}[{buginfo['status']}]{style.reset}",
-                  f"{style.italic}{buginfo['summary']}{style.reset}")
-
-        # Add any reviewers not in the original commit
-        to_add = []
-        rev_phids = [
-            reviewer['reviewerPHID']
-            for reviewer in revinfo.get('attachments', {})
-                .get('reviewers', {}).get('reviewers', [])
-        ]
-        for reviewer in commit.reviewers:
-            reviewerinfo = reviewer.info(conduit)
-            if reviewerinfo['phid'] not in rev_phids:
-                to_add.append(reviewerinfo['phid'])
-                if reviewerinfo['type'] == 'USER':
-                    label('Add Reviewer',
-                          reviewerinfo['fields']['realName'],
-                          f"[:{reviewerinfo['fields']['username']}]")
-                elif reviewerinfo['type'] == 'PROJ':
-                    label('Add Reviewer',
-                          reviewerinfo['fields']['name'],
-                          f"[#{reviewer.tag}]")
-        if len(to_add) > 0:
-            commit.add_transaction('reviewers.add', to_add)
-
-        print()
-
-    # Request user confirmation of printed information.
-    if not args.assume_yes:
-        if input(f"{style.bold}Proceed?{style.reset} (Y/n) ").lower() != 'y':
-            raise UserError('user aborted')
-        print()
-
-    # Perform the commit rewriting
-    parent = start
-    for commit in push:
-        print(f"{style.yellow}{commit.abbrev}{style.reset} {commit.subject}")
-
-        # Update transactions to reflect parent pushed revIDs, unless we should
-        # ignore our |start| parent due to --no-extern-deps
-        if not (args.no_extern_deps and parent is start):
-            for txn in commit.transactions:
-                if txn['type'] == 'summary':
-                    txn['value'] = commit.summary(parent)
-
-        diff = commit.get_diff().to_conduit(conduit)
-        label('Diff URI', diff['uri'])
-        commit.add_transaction('update', diff['phid'])
-
-        # Send the revision edit request.
-        params = { 'transactions': commit.transactions }
-        if commit.revision is not None:
-            params['objectIdentifier'] = commit.revision.info(conduit)['phid']
-        editrv = conduit.do('differential.revision.edit', **params)
-
-        # Get additional information about the newly created revision
-        if commit.revision is None:
-            revurl = Revision(editrv['object']['id']).url(conduit)
-        else:
-            revurl = commit.revision.url(conduit)
-        label('Revision', revurl)
-
-        # Perform a rewrite of the commit, and move to the next
-        commitmsg = commit.raw_body.strip()
-        if commit.revision is None:
-            commitmsg += f"\n\nDifferential Revision: {revurl}"
-        parent = commit.recommit(parent, commitmsg)
-
-    # Reparent remaining commits
-    for commit in reparent:
-        parent = commit.recommit(parent, commit.raw_body)
-
-    # Rewrite 'ref'
-    if initial_ref != parent:
-        print(f"{style.bold}Updating {style.yellow}{ref}{style.reset}")
-        label('Old Value', initial_ref.commit_hash)
-        label('New Value', parent.commit_hash)
-        check_output([
-            'git', 'update-ref', '-m', 'phlay: rewrite',
-            ref, parent.commit_hash, initial_ref.commit_hash,
-        ])
-
-
-def main():
-    parser = ArgumentParser(description='phlay commits onto differential')
-    parser.add_argument('--ref', '-r', nargs=1, default='HEAD',
-                        help='git ref to update after rewriting commits')
-    parser.add_argument('--assume-yes', '-y', action='store_true',
-                        help='disable confirmation prompts')
-    parser.add_argument('--arcrc', nargs=1, default='~/.arcrc',
-                        help='arc configuration file')
-    parser.add_argument('--color', default='auto',
-                        choices=['always', 'never', 'auto'],
-                        help='control output colorization')
-    parser.add_argument('--no-extern-deps', action='store_true',
-                        help='don\'t depend on revisions outside of push')
-    parser.add_argument('revspec', nargs='?', default='HEAD',
-                        help='commit range to phlay onto differential')
-    args = parser.parse_args()
-
-    try:
-        process_args(args)
-    except UserError as e:
-        style = Style(args.color, stream=sys.stderr)
-        print(f'{style.red}{style.bold}error{style.reset} {str(e)}',
-              file=sys.stderr)
-        sys.exit(1)
-
-
-if __name__ == '__main__':
+      end
+
+      # If the file is binary, mark it to be uploaded.
+      if delta.binary?
+        if !delta.added?
+          @uploads << {
+            :type => 'old',
+            :blob => $repo.lookup(delta.old_file[:oid]),
+            :metadata => metadata,
+          }
+        end
+
+        if !delta.deleted?
+          @uploads << {
+            :type => 'new',
+            :blob => $repo.lookup(delta.new_file[:oid]),
+            :metadata => metadata,
+          }
+        end
+      end
+    end
+
+    # Conduit |creatediff| endpoint parameters
+    @diff = {
+      :changes => changes,
+      :sourceControlSystem => $remote_vcs,
+      :sourceControlPath => '/',
+      :sourceControlBaseRevision => @base_hash,
+      :creationMethod => 'phlay',
+      :lintStatus => 'none',
+      :unitStatus => 'none',
+      :repositoryPHID => $conduit.repository[:phid],
+
+      # This seems like unnecessarially invasive info to send, and I don't know
+      # of a use for it. Let's send some hardcoded values.
+      :sourceMachine => 'localhost',
+      :sourcePath => '/',
+      :branch => 'master',
+    }
+  end
+
+  def self.init_git2hg(commits)
+    # Get the range of commits which need hashes
+    all = commit_range(commits.first.parents[0]) {|commit|
+      !(`git cinnabar git2hg #{commit.oid}` =~ /0{40}/)
+    }
+    all.concat commits
+
+    # Get the hg ID of our base commit, and record it.
+    base_oid = all.first.parents[0].oid
+    @@git2hg[base_oid] = `git cinnabar git2hg #{base_oid}`.strip
+
+    # Create the bundle & parse hashes from it
+    Dir.mktmpdir do |dir|
+      puts "Computing #{all.length} cinnabar changesets...".yellow.bold
+
+      bundle = "#{dir}/bundle"
+      range = "#{base_oid}..#{all.last.oid}"
+      system('git', 'cinnabar', 'bundle', '--version', '1', bundle, range)
+
+      open(bundle, 'rb') do |io|
+        raise 'bad bundle type' if io.read(6) != 'HG10UN'
+        all.each do |commit|
+          # Read our header (size = 84), and seek past the body.
+          body_size = io.read(4).unpack('N')[0] - 84
+          raise 'bad bundle entry' if body_size < 0
+
+          node, p1, p2, changeset = io.read(80).unpack('H40H40H40H40')
+          io.seek(body_size, IO::SEEK_CUR)
+
+          # Check our parent chain is sane
+          parent = @@git2hg[commit.parents[0].oid]
+          raise 'bad bundle parent' if parent != p1
+
+          # Record the mapping
+          @@git2hg[commit.oid] = node
+        end
+      end
+    end
+  end
+end
+
+# Get a range of commits starting at `start`, and ending the commit before the
+# predicate block returns `true`. Each commit must have exactly 1 parent.
+def commit_range(start)
+  commits = []
+  current = start
+  while !yield current
+    commits << current
+    raise 'cannot handle merge commits' if current.parents.length > 1
+    current = current.parents.first
+  end
+  commits.reverse!
+  return commits
+end
+
+def main()
+  args = Docopt::docopt $doc
+  if args["--version"]
+    puts $version
+    return
+  end
+
+  # Discover our repository root
+  $repo = Rugged::Repository.discover()
+  $conduit = Conduit.new $repo
+
+  # Check the type of repository being used
+  $remote_vcs = $repo.ref('refs/cinnabar/metadata') ? :hg : :git
+
+  # XXX(nika): Allow selecting arbitrary refs.
+  head = $repo.rev_parse('HEAD')
+
+  # Get the set of commits we're interested in
+  if args["<commit>"].include? '..'
+    base, tip = args["<commit>"].split('..', 2).map {|s| $repo.rev_parse(s)}
+    commits = commit_range(tip) {|p| p == base}
+  else
+    commits = [$repo.rev_parse(args["<commit>"])]
+  end
+
+  # Validate that our commit ranges look sane
+  raise 'no commits in range' if commits.empty?
+  after = commit_range(head) {|p| p == commits.last}
+
+  # Compute and log important information about each commit
+  metas = Meta.fetch commits
+  metas.each {|meta| meta.list_details}
+
+  # Prompt the user for confirmation
+  if !args["--yes"]
+    print "\nContinue? (Y/n) ".bold
+    if !['y', ''].include? STDIN.gets.strip.downcase
+      raise 'user aborted'
+    end
+    puts
+  end
+
+  # Perform uploads
+  metas.each {|meta|
+    meta.uploads.each {|upload|
+      puts "Uploading binary blob #{upload[:blob].oid}".bold.yellow
+
+      content = upload[:blob].content
+      phid = $conduit.file.upload! :data_base64 => Base64.strict_encode64(content)
+      upload[:metadata][:"#{upload[:type]}:file-size"] = content.length
+      upload[:metadata][:"#{upload[:type]}:binary-phid"] = phid
+      puts "  PHID = #{phid}"
+    }
+  }
+
+  # Push updated Diffs
+  metas.each {|meta|
+    puts "#{'Create Diff'.bold.yellow}      #{meta.new_title.italic}"
+    diff = $conduit.differential.creatediff! meta.diff
+    $conduit.differential.setdiffproperty! :diff_id => diff[:diffid],
+                                           :name => 'local:commits',
+                                           :data => JSON.dump(meta.phab_commits)
+    puts "  Diff URI = #{diff[:uri]}"
+    meta.update :update, diff[:phid]
+  }
+
+  # Create/Update revision information
+  parent_revision = nil
+  parent_commit = metas.first.commit.parent_ids[0]
+  metas.each {|meta|
+    status = meta.revision.nil? ? 'Create Revision' : 'Update Revision'
+    puts "#{status.bold.yellow}  #{meta.new_title.italic}"
+
+    meta.transactions.each {|txn|
+      if txn[:type] == :summary && !parent_revision.nil?
+        txn[:value] << "\n\nDepends on D#{parent_revision}"
+        txn[:value].strip!
+      end
+    }
+
+    params = { :transactions => meta.transactions }
+    if !meta.revision.nil?
+      params[:objectIdentifier] = meta.revision[:phid]
+    end
+
+    revision = $conduit.differential.revision.edit! params
+    uri = $conduit.uri + "/D#{revision[:object][:id]}"
+    puts "  Revision URI = #{uri}"
+    parent_revision = revision[:object][:id]
+
+    new_message = ("#{meta.commit.summary}" +
+                   "\n\n#{meta.new_summary}").strip +
+                   "\n\nDifferential Revision: #{uri}"
+    parent_commit = Rugged::Commit.create($repo,
+      :author => meta.commit.author,
+      :committer => meta.commit.committer,
+      :message => new_message,
+      :parents => [parent_commit],
+      :tree => meta.commit.tree)
+  }
+
+  # Reparent remaining commits
+  after.each {|commit|
+    parent_commit = Rugged::Commit.create($repo,
+      :author => commit.author,
+      :committer => commit.committer,
+      :message => commit.message,
+      :parents => [parent_commit],
+      :tree => commit.tree)
+  }
+
+  # Update HEAD to the new reference.
+  collection = Rugged::ReferenceCollection.new($repo)
+  collection.update($repo.head.resolve, parent_commit)
+  puts "Head updated to #{parent_commit}".yellow.bold
+end
+
+if __FILE__ == $0
+  begin
     main()
+  rescue Docopt::Exit => e
+    puts e.message
+  end
+end

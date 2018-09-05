@@ -6,13 +6,12 @@ a hacky tool for people using git for their Mozilla development, which rewrites
 git history, and pushes individual commits as revisions, with the correct bug
 number, reviewers, and dependencies.
 
-This tool is a single-file dependency free python script, which directly talks 
-to the Conduit API. Unfortunately, it currently lacks some features supported 
-by Arcanist (such as specifying the commit sha1 of base commits) due to 
-limitations in the `differential.createrawdiff` endpoint.
+This tool is a single-file ruby script, built on libgit2, which directly talks
+to the Conduit API. It aims to be feature complete, and handles complex tasks,
+such as diff parsing and metadata collection, locally.
 
-> **NOTE** This tool depends on `python >= 3.6`
+> **NOTE** This tool declares dependencies using `bundler/inline`
 
-> **NOTE** This is a hacky tool made for my own use, probably don't depend on 
-> it unless you're OK with it breaking.
-
+> **NOTE** This file used to be a single-file python script, but as complexity
+> grew, the need for dependencies became too much. The implementation was
+> replaced with a ruby one to take advantage of `Rugged` and `bundler/inline`.
