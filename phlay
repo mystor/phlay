@@ -759,7 +759,7 @@ def process_args(args):
             label('Set Bug',
                   f"Bug {commit.bug.bugno}",
                   f"{style.bold}[{buginfo['status']}]{style.reset}",
-                  f"{style.italic}{buginfo['summary']}{style.reset}")
+                  f"{buginfo['summary']}")
 
         # Add any reviewers not in the original commit
         to_add = []
