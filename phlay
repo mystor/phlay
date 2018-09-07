@@ -23,8 +23,11 @@ NULL_SHA1 = '0' * 40
 
 class Style:
     """ANSI color helper"""
-    COLORS = 'black blue cyan green magenta red white yellow'.split()
-    SUGAR = dict(reset='sgr0', italic='sitm')
+    class Wrap(str):
+        def __call__(self, s):
+            if self == '':
+                return str(s)
+            return self + str(s) + curses.tparm(curses.tigetstr('sgr0')).decode()
 
     def __init__(self, color, stream=sys.stdout):
         self.styled = color == 'always' or (color == 'auto' and stream.isatty())
@@ -36,12 +39,11 @@ class Style:
         if not self.styled:
             return ''
         if '_' in name:
-            return ''.join(getattr(self, n) for n in name.split('_'))
-        name = self.SUGAR.get(name, name)
-        if name in self.COLORS:
-            num = getattr(curses, 'COLOR_' + name.upper())
-            return curses.tparm(self._setf, num).decode('latin1')
-        return curses.tparm(curses.tigetstr(name)).decode('latin1')
+            return self.Wrap(''.join(getattr(self, n) for n in name.split('_')))
+        call = [curses.tigetstr(name)]
+        if name in 'black blue cyan green magenta red white yellow'.split():
+            call = [self._setf, getattr(curses, 'COLOR_' + name.upper())]
+        return self.Wrap(curses.tparm(*call).decode())
 
 
 class UserError(Exception):
@@ -109,8 +111,6 @@ class Conduit:
 
 
 class Diff:
-    """simple diff parser"""
-
     Hunk = namedtuple('Hunk', ['old_off', 'old_len', 'new_off', 'new_len',
                                'added', 'deleted', 'corpus'])
 
@@ -321,8 +321,7 @@ class Diff:
                 print(f"    File PHID: {upload['phid']}")
 
     def do_publish(self, style, conduit):
-        print(f"{style.yellow}{style.bold}Publishing Patch{style.reset}",
-              f"{self.commit.summary}")
+        print(style.bold_yellow('Publishing Patch'), f"{self.commit.summary}")
         changes = [change.to_conduit(self.commit)
                    for change in self.changes.values()]
         diff = conduit.do('differential.creatediff',
@@ -698,17 +697,19 @@ def process_args(args):
     # Stash the current sha1 for |ref|
     initial_ref = Commit(ref)
 
+    print(style.bold_yellow("Calculating Hg Changesets"))
     # Ensure we have a mercurial hash for each commit we want to push.
     ensure_hg_hashes(push)
 
     # Define a helper for printing styled & labeled information to stdout.
     def label(label, *rest):
-        body = ' '.join(str(s) for s in rest).replace('\n', '\n    ')
-        print(f"  {style.bold_cyan}{label}{style.reset}\n    {body}")
+        print('  ' + style.bold_cyan(label))
+        print('    ' + ' '.join(str(s) for s in rest).replace('\n', '\n    '))
 
     # Validate that everything exists, and show computed info
     for idx, commit in enumerate(push):
-        print(f"{style.yellow}{commit.abbrev}{style.reset} {commit.subject}")
+        print()
+        print(f"{style.yellow(commit.abbrev)} {commit.subject}")
 
         # Produce an error if no bug # was specified
         if commit.bug is None:
@@ -737,10 +738,9 @@ def process_args(args):
         longest = max(len(name) for name in diff.changes)
         for path, change in diff.changes.items():
             summary += f"{path:<{longest}} "
-            summary += f"{style.bold}+{change.added:<3} -{change.deleted:<3}{style.reset}\n"
-        summary += style.bold
-        summary += f"{len(diff.changes)} files (+{diff.added}, -{diff.deleted})"
-        summary += style.reset
+            summary += style.bold(f"+{change.added:<3} -{change.deleted:<3}\n")
+        summary += style.bold(f"{len(diff.changes)} files")
+        summary += f" (+{style.green(diff.added)}, -{style.red(diff.deleted)})"
         label('Changes', summary)
 
         # Title Updates
@@ -761,10 +761,8 @@ def process_args(args):
         oldbugno = revfields.get('bugzilla.bug-id')
         if oldbugno != str(commit.bug.bugno):
             commit.add_transaction('bugzilla.bug-id', str(commit.bug.bugno))
-            label('Set Bug',
-                  f"Bug {commit.bug.bugno}",
-                  f"{style.bold}[{buginfo['status']}]{style.reset}",
-                  f"{buginfo['summary']}")
+            label('Set Bug', f"Bug {commit.bug.bugno}",
+                  style.bold(f"[{buginfo['status']}]"), f"{buginfo['summary']}")
 
         # Add any reviewers not in the original commit
         to_add = []
@@ -788,13 +786,11 @@ def process_args(args):
         if len(to_add) > 0:
             commit.add_transaction('reviewers.add', to_add)
 
-        print()
-
     # Request user confirmation of printed information.
     if not args.assume_yes:
-        if input(f"{style.bold}Proceed?{style.reset} (Y/n) ").lower() != 'y':
+        if input(style.bold('\nProceed? (Y/n) ')).lower() != 'y':
             raise UserError('user aborted')
-        print()
+    print()
 
     # Perform all uploads, and then publish all patches.
     for commit in push:
@@ -806,8 +802,7 @@ def process_args(args):
     # Perform the commit rewriting
     parent = start
     for idx, commit in enumerate(push):
-        print(f"{style.yellow}{style.bold}Requesting Review{style.reset}",
-              f"{commit.summary}")
+        print(style.bold_yellow(f"Requesting Review"), f"{commit.summary}")
 
         # Update transactions to reflect parent pushed revIDs
         for txn in commit.transactions:
@@ -839,10 +834,9 @@ def process_args(args):
 
     # Rewrite 'ref'
     if initial_ref != parent:
-        print(f"{style.bold}Updating {style.yellow}{ref}{style.reset}")
-        label('Old Value', initial_ref.commit_hash)
-        label('New Value', parent.commit_hash)
-        check_output([
+        print(style.bold_yellow(f"Updating {ref}"))
+        print(f"  {initial_ref.abbrev} => {parent.abbrev}")
+        check_call([
             'git', 'update-ref', '-m', 'phlay: rewrite',
             ref, parent.commit_hash, initial_ref.commit_hash,
         ])
@@ -869,8 +863,7 @@ def main():
         process_args(args)
     except UserError as e:
         style = Style(args.color, stream=sys.stderr)
-        print(f'{style.red}{style.bold}error{style.reset} {str(e)}',
-              file=sys.stderr)
+        print(style.bold_red('error'), e, file=sys.stderr)
         sys.exit(1)
 
 
