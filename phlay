@@ -58,8 +58,6 @@ class Conduit:
                         .decode().strip())
         with open(self.top / '.arcconfig') as f:
             arcconfig = json.load(f)
-        with open(Path(arcrc_path).expanduser()) as f:
-            arcrc = json.load(f)
 
         # Load the URL from the local arcconfig
         self.url = urlparse(arcconfig['phabricator.uri'])
@@ -67,19 +65,38 @@ class Conduit:
             raise UserError('Only HTTPS scheme phabricator.uri are supported')
 
         # Find our authentication token
+        arcrc_path = Path(arcrc_path).expanduser()
+        arcrc = {}
         try:
+            with open(arcrc_path) as f:
+                arcrc = json.load(f)
+
             self.token = next(data['token'] for url, data in arcrc['hosts'].items()
                               if urlparse(url).netloc == self.url.netloc)
-        except:
-            raise UserError(f'No token for host {self.url.netloc}')
+        except IOError, StopIteration:
+            self.token = input(f"""\
+LOGIN TO PHABRICATOR
+
+Open this page in your browser, and login if necessary:
+https://{self.url.netloc}/conduit/login
+
+API Token from that page: """).strip()
+
+            # Double-check the token works
+            self.do('user.whoami')
+
+            # Update our arcrc
+            api_uri = f"https://{self.url.netloc}/api/"
+            arcrc['hosts'] = arcrc.get('hosts', {})
+            arcrc['hosts'][api_uri] = arcrc['hosts'].get(api_uri, {})
+            arcrc['hosts'][api_uri]['token'] = self.token
+            with open(arcrc_path, 'w') as f:
+                json.dump(arcrc, f, indent=2)
 
         # Connect to Conduit to determine our repository's PHID
-        self.callsign = arcconfig['repository.callsign']
         self.repository = self.search_one('diffusion.repository', {
             'callsigns': [arcconfig['repository.callsign']]
         })
-
-        self.user = self.do('user.whoami')
         self.hostname = socket.gethostname()
 
     def do(self, cmd_name, **params):
@@ -508,8 +525,9 @@ class Commit(Cached):
         self.bug = bugmatch and Bug(bugmatch.group(1))
 
         # Parse the reviewer list
+        reviewer_re = r'r((?:[?=,][^,\s]+)+)'
         self.reviewers = []
-        for rmatch in re.finditer(r'r((?:[?=,][^,\s]+)+)', self.subject, re.I):
+        for rmatch in re.finditer(reviewer_re, self.subject, re.I):
             for name in re.split(r'[?=,]', rmatch.group(1))[1:]:
                 self.reviewers.append(Reviewer(name))
 
@@ -522,6 +540,9 @@ class Commit(Cached):
             r'^Differential\s+Revision:\s*(.*/)?D([0-9]+)$',
             rev_replace, self.body, count=1, flags=re.I | re.M
         ).strip()
+
+        self.title = re.sub(reviewer_re, '', self.subject, flags=re.I) \
+                       .strip(' ,.;')
 
         # Check if this commit has a corresponding mercurial hash already
         # computed and cached. If we don't, and we need it, we will compute it
@@ -655,7 +676,10 @@ def get_revisions(args):
 
     # Determine which commits to reparent vs. push
     if '..' in args.revspec:
-        start, end = map(Commit, args.revspec.split('..', 1))
+        start, end = args.revspec.split('..', 1)
+        if len(end) == 0:
+            end = 'HEAD'
+        start, end = Commit(start), Commit(end)
     else:
         end = Commit(args.revspec)
         start = end.parent()
@@ -712,12 +736,7 @@ def process_args(args):
 
         # Determine which revision we're working with
         if commit.revision is None:
-            buginfo = commit.bug.info(conduit)
-            label('New Revision', f"""\
-{style.bold('Bug ' + str(commit.bug.bugno))} {buginfo['status']} {buginfo['resolution']}
-  {buginfo['summary']}
-  {style.bold('Assigned To')} {buginfo['assigned_to_detail']['real_name']}
-{style.bold('Repository')} {conduit.repository['fields']['name']}""")
+            label('New Revision', conduit.repository['fields']['name'])
 
             commit.add_transaction('repositoryPHID', conduit.repository['phid'])
             commit.add_transaction('bugzilla.bug-id', str(commit.bug.bugno))
@@ -733,21 +752,25 @@ def process_args(args):
                 raise UserError('mismatched bug # ' +
                                 revfields['bugzilla.bug-id'])
 
+        # Always write out basic bug info
+        buginfo = commit.bug.info(conduit)
+        label(f"Bug {commit.bug.bugno}", buginfo['summary'])
+
         # Log computed information about the patch to be pushed
         diff = commit.diff()
         summary = ''
         longest = max(len(name) for name in diff.changes)
         for path, change in diff.changes.items():
             summary += f"{path:<{longest}} "
-            summary += style.bold(f"+{change.added:<3} -{change.deleted:<3}\n")
+            summary += style.bold(f"+{change.added}, -{change.deleted}\n")
         summary += style.bold(f"{len(diff.changes)} files")
-        summary += f" (+{style.green(diff.added)}, -{style.red(diff.deleted)})"
+        summary += f" (+{diff.added}, -{diff.deleted})"
         label('Changes', summary)
 
         # Title Updates
-        if not commit.revision or revinfo['fields']['title'] != commit.subject:
-            commit.add_transaction('title', commit.subject)
-            label('Set Title', commit.subject)
+        if not commit.revision or revinfo['fields']['title'] != commit.title:
+            commit.add_transaction('title', commit.title)
+            label('Set Title', commit.title)
 
         # Summary Updates
         oldsummary = commit.revision and commit.revision.summary(conduit)
@@ -791,7 +814,7 @@ def process_args(args):
 
     # Request user confirmation of printed information.
     if not args.assume_yes:
-        if input(style.bold('\nProceed? (Y/n) ')).lower() != 'y':
+        if input(style.bold('\nProceed? (y/N) ')).lower() != 'y':
             raise UserError('user aborted')
     print()
 
