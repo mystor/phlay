@@ -427,7 +427,7 @@ class Blob(Cached):
         if self.is_null():
             return None
         if self._body is None:
-            self._body = check_output('git', 'cat-file', 'blob', self.hash)
+            self._body = check_output(['git', 'cat-file', 'blob', self.hash])
         return self._body
 
 
