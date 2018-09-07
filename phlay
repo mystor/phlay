@@ -13,6 +13,9 @@ import json
 import curses
 import base64
 import socket
+import difflib
+from collections import namedtuple
+from enum import Enum
 
 
 NULL_SHA1 = '0' * 40
@@ -32,6 +35,8 @@ class Style:
     def __getattr__(self, name):
         if not self.styled:
             return ''
+        if '_' in name:
+            return ''.join(getattr(self, n) for n in name.split('_'))
         name = self.SUGAR.get(name, name)
         if name in self.COLORS:
             num = getattr(curses, 'COLOR_' + name.upper())
@@ -103,207 +108,223 @@ class Conduit:
         return resp['data'][0]
 
 
-class Hunk:
-    def __init__(self, a_offset, a_length, b_offset, b_length):
-        self.a_offset = a_offset
-        self.a_length = a_length
-        self.b_offset = b_offset
-        self.b_length = b_length
-        self.corpus = []
-
-    def to_conduit(self, _conduit):
-        return {
-            'oldOffset': self.a_offset,
-            'oldLength': self.a_length,
-            'newOffset': self.b_offset,
-            'newLength': self.b_length,
-            'corpus': '\n'.join(self.corpus),
-        }
-
-
-class Change:
-    """Individual file change as part of a changeset"""
-    # I just love magic numbers~!
-    TYPE_ADD        = 1
-    TYPE_CHANGE     = 2
-    TYPE_DELETE     = 3
-
-    # XXX(nika): Add support for moves/copies
-    TYPE_MOVE_AWAY  = 4
-    TYPE_COPY_AWAY  = 5
-    TYPE_MOVE_HERE  = 6
-    TYPE_COPY_HERE  = 7
-    TYPE_MULTICOPY  = 8
-
-    FILE_TEXT       = 1
-    FILE_IMAGE      = 2
-    FILE_BINARY     = 3
-    FILE_DIRECTORY  = 4
-    FILE_SYMLINK    = 5
-    FILE_DELETED    = 6
-    FILE_NORMAL     = 7
-
-    def __init__(self, a_mode, b_mode, a_sha, b_sha, kind, a_path, b_path):
-        self.a_mode = a_mode
-        self.b_mode = b_mode
-        self.a_blob = Blob(a_sha)
-        self.b_blob = Blob(b_sha)
-        self.kind = kind
-        self.a_path = a_path
-        self.b_path = b_path
-
-        # Information about diff state
-        self.hunks = []
-        self.added = 0
-        self.removed = 0
-        self.binary = False
-
-    def to_conduit(self, conduit):
-        # Upload binary blobs if necessary.
-        metadata = {}
-        if self.binary and self.b_blob.body() is not None:
-            data_base64 = base64.standard_b64encode(self.b_blob.body()).decode()
-            binary_phid = conduit.do('file.upload', data_base64=data_base64)
-            metadata = {
-                'old:file-size': len(self.a_blob.body()),
-                'new:file-size': len(self.b_blob.body()),
-                'new:binary-phid': binary_phid,
-                # XXX(nika): Guess mime type?
-            }
-
-        old_props = { 'unix:filemode': self.a_mode } if self.a_path else {}
-        new_props = { 'unix:filemode': self.b_mode } if self.b_path else {}
-
-        return {
-            'metadata': metadata,
-            'oldProperties': old_props,
-            'newProperties': new_props,
-            'oldPath': self.a_path,
-            'currentPath': self.b_path,
-            'addLines': self.added,
-            'delLines': self.removed,
-            'type': self.kind,
-            'fileType': self.FILE_BINARY if self.binary else self.FILE_TEXT,
-            'hunks': [hunk.to_conduit(conduit) for hunk in self.hunks],
-        }
-
-
 class Diff:
     """simple diff parser"""
+
+    Hunk = namedtuple('Hunk', ['old_off', 'old_len', 'new_off', 'new_len',
+                               'added', 'deleted', 'corpus'])
+
+    class Change:
+        def __init__(self, path):
+            self.old_mode = None
+            self.cur_mode = None
+            self.old_path = None
+            self.cur_path = path
+            self.away_paths = []
+            self.kind = Diff.Kind.CHANGE
+            self.binary = False
+            self.file_type = Diff.FileType.TEXT
+            self.uploads = []
+            self.hunks = []
+
+        @property
+        def added(self):
+            return sum(hunk.added for hunk in self.hunks)
+
+        @property
+        def deleted(self):
+            return sum(hunk.deleted for hunk in self.hunks)
+
+        def to_conduit(self, commit):
+            # Record upload information
+            metadata = {}
+            for upload in self.uploads:
+                metadata[f'{upload["type"]}:binary-phid'] = upload['phid']
+                metadata[f'{upload["type"]}:file-size'] = len(upload['value'])
+
+            # Translate hunks
+            hunks = [{
+                'oldOffset': hunk.old_off,
+                'oldLength': hunk.old_len,
+                'newOffset': hunk.new_off,
+                'newLength': hunk.new_len,
+                # isMissingOldNewline
+                # isMissingNewNewline
+                'corpus': hunk.corpus,
+            } for hunk in self.hunks]
+
+            old_props = {'unix:filemode': self.old_mode} if self.old_mode else {}
+            cur_props = {'unix:filemode': self.cur_mode} if self.cur_mode else {}
+
+            added = sum(hunk.added for hunk in self.hunks)
+            deleted = sum(hunk.deleted for hunk in self.hunks)
+
+            return {
+                'metadata': metadata,
+                'oldPath': self.old_path,
+                'currentPath': self.cur_path,
+                'awayPaths': self.away_paths,
+                'oldProperties': old_props,
+                'newProperties': cur_props,
+                'commitHash': commit.hg_hash,
+                'type': self.kind,
+                'fileType': self.file_type,
+                'hunks': hunks,
+            }
+
+    class Kind(Enum):
+        ADD = 1
+        CHANGE = 2
+        DELETE = 3
+        MOVE_AWAY = 4
+        COPY_AWAY = 5
+        MOVE_HERE = 6
+        COPY_HERE = 7
+        MULTICOPY = 8
+
+    class FileType(Enum):
+        TEXT = 1
+        IMAGE = 2 # XXX(nika): Generate this sometimes?
+        BINARY = 3
+        DIRECTORY = 4 # Should never show up...
+        SYMLINK = 5 # XXX(nika): Support symlinks (do we care?)?
+        DELETED = 6
+        NORMAL = 7
+
     def __init__(self, commit):
         self.commit = commit
-        self.changes = []
+        self.changes = {}
+        self.phid = None
 
-        hash_to_changes = {}
+        raw = check_output(['git', 'diff-tree', '-r', '--raw', '-z',
+                            '--no-abbrev', commit.commit_hash]).decode()
+        # Strip the prefix sha1, and remove the trailing null
+        for c in raw[:-1].split('\0:')[1:]:
+            self.parse_change(c)
 
-        # Get a combined raw & patch diff from git diff-tree. The sections will
-        # be separated by '\0\0'.
-        [raw, patch] = check_output([
-            'git', 'diff-tree', '-r',
-            '--no-ext-diff', '--no-textconv', '--no-color', # No customization
-            '--raw', '-z',        # Add easy-to-parse \0-separated header
-            '--patch', '-U32767', # Include all patch context
-            '--full-index',       # Don't abbreviate the index sha1s
-            commit.commit_hash
-        ]).decode().split('\0\0', maxsplit=1)
+    @property
+    def added(self):
+        return sum(change.added for change in self.changes.values())
 
-        # Split the raw section on '\0:', the delimiter between raw changes
-        [junk, *raw_changes] = raw.split('\0:')
-        assert junk == commit.commit_hash, "unexpected junk leader!"
-        for change in raw_changes:
-            # '--raw -z' only uses '\0' to split paths, other sections are still
-            # space-separated.
-            [fields, a_path, *rest] = change.split('\0')
-            [a_mode, b_mode, a_hash, b_hash, kind] = fields.split(' ')
+    @property
+    def deleted(self):
+        return sum(change.deleted for change in self.changes.values())
 
-            # Determine which paths we are working with.
-            b_path = a_path
-            if len(rest) == 1:
-                b_path = rest[0]
+    def change_for(self, path):
+        if path not in self.changes:
+            self.changes[path] = self.Change(path)
+        return self.changes[path]
 
-            if kind[0] == 'A':
-                a_path = None
-                phk = Change.TYPE_ADD
-            elif kind[0] == 'D':
-                b_path = None
-                phk = Change.TYPE_DELETE
-            elif kind[0] == 'M':
-                phk = 0
+    def parse_change(self, raw):
+        """Parse a single raw change into a Change object"""
+        # `--raw -z` only uses '\0' to split paths, other sections are still
+        # space-separated.
+        [fields, *paths] = raw.split('\0')
+        [a_mode, b_mode, a_blob, b_blob, kind_l] = fields.split(' ')
+
+        # Figure out what paths and modes to use
+        if len(paths) == 2:
+            [a_path, b_path] = paths
+        else:
+            a_path = b_path = paths[0]
+        change = self.change_for(b_path)
+
+        # Extract the bodies of blobs to compare
+        a_body, b_body = b'', b''
+        if a_blob != NULL_SHA1:
+            a_body = check_output(['git', 'cat-file', 'blob', a_blob])
+        if b_blob != NULL_SHA1:
+            b_body = check_output(['git', 'cat-file', 'blob', b_blob])
+
+        # Detect if we're binary, and generate a unified diff
+        change.binary = b'\0' in a_body or b'\0' in b_body
+        if change.binary:
+            change.uploads = [
+                {'type': 'old', 'value': a_body, 'phid': None},
+                {'type': 'new', 'value': b_body, 'phid': None},
+            ]
+            change.hunks = []
+            change.file_type = self.FileType.BINARY
+        else:
+            change.uploads = []
+            # Generate the diff using difflib
+            [hdr, *corpus] = list(difflib.unified_diff(
+                a_body.decode().splitlines(),
+                b_body.decode().splitlines(),
+                n=99999999,
+            ))[2:]
+
+            # Match on the hunk line
+            m = re.match(r'@@ -(\d+),(\d+) \+(\d+),(\d+) @@', hdr, re.I)
+            change.hunks = [self.Hunk(
+                old_off=int(m.group(1)), old_len=int(m.group(2)),
+                new_off=int(m.group(3)), new_len=int(m.group(4)),
+                added=sum(1 for l in corpus if l[0] == '+'),
+                deleted=sum(1 for l in corpus if l[0] == '-'),
+                corpus='\n'.join(corpus),
+            )]
+            change.file_type = self.FileType.TEXT
+
+        # Determine the correct kind from the letter
+        if kind_l[0] == 'A':
+            change.kind = self.Kind.ADD
+            change.new_mode = b_mode
+
+        elif kind_l[0] == 'D':
+            change.kind = self.Kind.DELETE
+            change.old_mode = a_mode
+
+        elif kind_l[0] == 'M':
+            change.kind = self.Kind.CHANGE
+            change.old_mode = a_mode
+            change.new_mode = b_mode
+
+        elif kind_l[0] == 'R':
+            change.kind = self.Kind.MOVE_HERE
+            change.old_mode = a_mode
+            change.new_mode = b_mode
+
+            change.old_path = a_path
+            old = self.change_for(change.old_path)
+            if old.kind in [self.Kind.MOVE_AWAY, self.Kind.COPY_AWAY]:
+                old.kind = self.Kind.MULTICOPY
+            elif old.kind != self.Kind.MULTICOPY:
+                old.kind = self.Kind.MOVE_AWAY
+            old.away_paths.append(change.cur_path)
+
+        elif kind_l[0] == 'C':
+            change.kind = self.Kind.COPY_HERE
+            change.old_mode = a_mode
+            change.new_mode = b_mode
+
+            change.old_path = a_path
+            old = self.change_for(change.old_path)
+            if old.kind == self.Kind.MOVE_AWAY:
+                old.kind = self.Kind.MULTICOPY
             else:
-                raise UserError(f"Unhandled change type {kind}")
+                old.kind = self.Kind.COPY_AWAY
+            old.away_paths.append(change.cur_path)
 
-            # Create the change for this raw change.
-            change = Change(a_mode, b_mode, a_hash, b_hash, phk, a_path, b_path)
+        else:
+            raise f"unsupported change type {kind_l[0]}"
 
-            # Add the change to the list in question.
-            self.changes.append(change)
-            hash_to_changes[f"{a_hash}..{b_hash}"] = change
+        return change
 
-        # Walk through lines in the patch. Reading an 'index' line will switch
-        # to a new diff entry.
-        active_change = None
-        active_hunk = None
-        a_hunk_remaining = 0
-        b_hunk_remaining = 0
-        for line in patch.splitlines():
-            # Check for entering a new entry's header
-            indexmatch = re.match(r'index ([a-f0-9]{40}..[a-f0-9]{40})', line, re.I)
-            if indexmatch:
-                active_change = hash_to_changes[indexmatch.group(1)]
-                continue
-            elif active_change is None:
-                continue
+    def do_uploads(self, style, conduit):
+        for change in self.change.values():
+            for upload in change.uploads:
+                print(f"{style.yellow}{style.bold}Uploading Binary{style.reset}",
+                      f"{change.cur_path}")
+                data_base64 = base64.standard_b64encode(upload['value'])
+                upload['phid'] = conduit.do('file.upload',
+                                            data_base64=data_base64.decode())
+                print(f"    File PHID: {upload['phid']}")
 
-            # Detect binary diffs
-            if line.startswith('Binary files'): # XXX(nika): more robust?
-                assert len(active_change.hunks) == 0, "binary files have no hunks"
-                active_change.binary = True
-            if active_change.binary:
-                continue
-
-            # Detect hunks
-            hunkmatch = re.match(r'@@ -(\d+),(\d+) \+(\d+),(\d+) @@', line, re.I)
-            if hunkmatch:
-                active_hunk = Hunk(int(hunkmatch.group(1)),
-                                   int(hunkmatch.group(2)),
-                                   int(hunkmatch.group(3)),
-                                   int(hunkmatch.group(4)))
-                active_change.hunks.append(active_hunk)
-
-                # Keep track of how many lines are remaining for each hunk.
-                a_hunk_remaining = active_hunk.a_length
-                b_hunk_remaining = active_hunk.b_length
-                continue
-            elif active_hunk is None:
-                continue
-
-            # Add additions, removals, and context to the current hunk.
-            if line[0] == '+':
-                assert b_hunk_remaining > 0
-                active_change.added += 1
-                b_hunk_remaining -= 1
-                active_hunk.corpus.append(line)
-
-            if line[0] == '-':
-                assert a_hunk_remaining > 0
-                active_change.removed += 1
-                a_hunk_remaining -= 1
-                active_hunk.corpus.append(line)
-
-            if line[0] == ' ':
-                a_hunk_remaining -= 1
-                b_hunk_remaining -= 1
-                active_hunk.corpus.append(line)
-
-            # If we've seen all of the lines for the current hunk, end it.
-            if a_hunk_remaining == 0 and b_hunk_remaining == 0:
-                active_hunk = None
-
-        self.added = sum(c.added for c in self.changes)
-        self.removed = sum(c.removed for c in self.changes)
-
-    def to_conduit(self, conduit):
-        changes = [ch.to_conduit(conduit) for ch in self.changes]
+    def do_publish(self, style, conduit):
+        print(f"{style.yellow}{style.bold}Publishing Patch{style.reset}",
+              f"{self.commit.summary}")
+        changes = [change.to_conduit(self.commit)
+                   for change in self.changes.values()]
         diff = conduit.do('differential.creatediff',
                           changes=changes,
                           sourceMachine=conduit.hostname,
@@ -317,9 +338,10 @@ class Diff:
                           sourcePath=str(conduit.top),
                           # XXX(nika): This seems kinda irrelevant?
                           branch='HEAD')
+        print(f"    Diff URI: {diff['uri']}")
 
-        # Add information about local commits to the patch. This info is needed
-        # by lando.
+        # Add information about our local commit to the patch. This info is
+        # needed by lando.
         conduit.do('differential.setdiffproperty',
                    diff_id=diff['diffid'],
                    name='local:commits',
@@ -328,9 +350,14 @@ class Diff:
                            'author': self.commit.author_name,
                            'authorEmail': self.commit.author_email,
                            'time': int(self.commit.unix_date),
+                           'summary': self.commit.summary,
+                           'message': self.commit.raw_body,
+                           'commit': self.commit.hg_hash,
+                           'tree': self.commit.tree_hash,
+                           'parents': [self.commit.parent().hg_hash],
                        }
                    }))
-        return diff
+        return diff['phid']
 
 
 class Cached:
@@ -364,7 +391,7 @@ class Revision(Cached):
         if self._info is None:
             self._info = conduit.search_one('differential.revision', {
                 'ids': [self.revid]
-            }, attachments={ 'reviewers': True })
+            }, attachments={'reviewers': True})
         return self._info
 
     def url(self, conduit):
@@ -482,7 +509,7 @@ class Commit(Cached):
         def rev_replace(match):
             self.revision = Revision(match.group(2))
             return ""
-        self._summary = re.sub(
+        self.summary = re.sub(
             r'^Differential\s+Revision:\s*(.*/)?D([0-9]+)$',
             rev_replace, self.body, count=1, flags=re.I | re.M
         ).strip()
@@ -519,20 +546,11 @@ class Commit(Cached):
             'value': value,
         })
 
-    def summary(self, parent, pending_deps=False):
-        summary = self._summary
-
-        # If we have a valid parent revision, we can declare a dependency on it.
-        # If we're allowed to have pending dependencies (pending_deps is true),
-        # then we can declare a dependency on '<pending>'. Otherwise, we don't
-        # depend on anything.
-        if parent is not None:
-            if parent.revision:
-                summary += f"\n\nDepends on D{parent.revision.revid}"
-            elif pending_deps:
-                summary += f"\n\nDepends on D<pending>"
-
-        return summary.strip()
+    def new_summary(self, parent):
+        if parent is None:
+            return self.summary
+        revid = parent.revision.revid if parent.revision else '<pending>'
+        return f"{self.summary}\n\nDepends on D{revid}".strip()
 
     def recommit(self, parent, message):
         message = message.strip()  # Make sure to clean up trailing whitespace
@@ -684,32 +702,17 @@ def process_args(args):
     ensure_hg_hashes(push)
 
     # Define a helper for printing styled & labeled information to stdout.
-    def label(label, *rest, warn=False):
-        color = style.bold + (style.red if warn else style.cyan)
-        body = ' '.join(str(s) for s in rest)
-        if '\n' in body:
-            indent = '\n    '
-            body = body.replace('\n', indent)
-        else:
-            indent = ' ' * (14 - len(label))
-        print(f"  {color}{label}{style.reset}{indent}{body}")
+    def label(label, *rest):
+        body = ' '.join(str(s) for s in rest).replace('\n', '\n    ')
+        print(f"  {style.bold_cyan}{label}{style.reset}\n    {body}")
 
     # Validate that everything exists, and show computed info
-    for commit in push:
+    for idx, commit in enumerate(push):
         print(f"{style.yellow}{commit.abbrev}{style.reset} {commit.subject}")
 
         # Produce an error if no bug # was specified
         if commit.bug is None:
             raise UserError(f"no bug # specified")
-
-        # Determine which commit we're going to depend on, respecting
-        # --no-extern-deps.
-        dep_parent = commit.parent()
-        if args.no_extern_deps and dep_parent is start:
-            dep_parent = None
-        elif not (dep_parent.is_public or dep_parent is not start):
-            print(f"{style.red}{style.bold}warning: parent not public",
-                  f"(no revid, not hg){style.reset}", file=sys.stderr)
 
         # Determine which revision we're working with
         if commit.revision is None:
@@ -719,9 +722,6 @@ def process_args(args):
             revinfo = commit.revision.info(conduit)
             label('Revision', commit.revision.url(conduit))
         revfields = revinfo.get('fields', {})
-
-        # Log computed mercurial hashes.
-        label('Mercurial', f"{commit.hg_hash}")
 
         # Specify which repository we're working with
         oldrepo = revfields.get('repositoryPHID')
@@ -733,10 +733,15 @@ def process_args(args):
 
         # Log computed information about the patch to be pushed
         diff = commit.get_diff()
-        label('Changes',
-              f"{style.bold}{len(diff.changes)} files{style.reset}, "
-              f"{style.green}+{diff.added}{style.reset}, "
-              f"{style.red}-{diff.removed}{style.reset}")
+        summary = ''
+        longest = max(len(name) for name in diff.changes)
+        for path, change in diff.changes.items():
+            summary += f"{path:<{longest}} "
+            summary += f"{style.bold}+{change.added:<3} -{change.deleted:<3}{style.reset}\n"
+        summary += style.bold
+        summary += f"{len(diff.changes)} files (+{diff.added}, -{diff.deleted})"
+        summary += style.reset
+        label('Changes', summary)
 
         # Title Updates
         oldtitle = revfields.get('title')
@@ -746,7 +751,7 @@ def process_args(args):
 
         # Summary Generation
         oldsummary = revfields.get('summary')
-        summary = commit.summary(dep_parent, pending_deps=dep_parent is not start)
+        summary = commit.new_summary(commit.parent() if idx > 0 else None)
         if oldsummary != summary:
             commit.add_transaction('summary', summary)
             label('Set Summary', summary)
@@ -791,24 +796,26 @@ def process_args(args):
             raise UserError('user aborted')
         print()
 
+    # Perform all uploads, and then publish all patches.
+    for commit in push:
+        commit.get_diff().do_uploads(style, conduit)
+    for commit in push:
+        phid = commit.get_diff().do_publish(style, conduit)
+        commit.add_transaction('update', phid)
+
     # Perform the commit rewriting
     parent = start
-    for commit in push:
-        print(f"{style.yellow}{commit.abbrev}{style.reset} {commit.subject}")
+    for idx, commit in enumerate(push):
+        print(f"{style.yellow}{style.bold}Requesting Review{style.reset}",
+              f"{commit.summary}")
 
-        # Update transactions to reflect parent pushed revIDs, unless we should
-        # ignore our |start| parent due to --no-extern-deps
-        if not (args.no_extern_deps and parent is start):
-            for txn in commit.transactions:
-                if txn['type'] == 'summary':
-                    txn['value'] = commit.summary(parent)
-
-        diff = commit.get_diff().to_conduit(conduit)
-        label('Diff URI', diff['uri'])
-        commit.add_transaction('update', diff['phid'])
+        # Update transactions to reflect parent pushed revIDs
+        for txn in commit.transactions:
+            if txn['type'] == 'summary':
+                txn['value'] = commit.new_summary(parent if idx > 0 else None)
 
         # Send the revision edit request.
-        params = { 'transactions': commit.transactions }
+        params = {'transactions': commit.transactions}
         if commit.revision is not None:
             params['objectIdentifier'] = commit.revision.info(conduit)['phid']
         editrv = conduit.do('differential.revision.edit', **params)
@@ -818,7 +825,7 @@ def process_args(args):
             revurl = Revision(editrv['object']['id']).url(conduit)
         else:
             revurl = commit.revision.url(conduit)
-        label('Revision', revurl)
+        print(f"    Revision URI: {revurl}")
 
         # Perform a rewrite of the commit, and move to the next
         commitmsg = commit.raw_body.strip()
