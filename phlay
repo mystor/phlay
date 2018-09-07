@@ -865,8 +865,6 @@ def main():
     parser.add_argument('--color', default='auto',
                         choices=['always', 'never', 'auto'],
                         help='control output colorization')
-    parser.add_argument('--no-extern-deps', action='store_true',
-                        help='don\'t depend on revisions outside of push')
     parser.add_argument('revspec', nargs='?', default='HEAD',
                         help='commit range to phlay onto differential')
     args = parser.parse_args()
