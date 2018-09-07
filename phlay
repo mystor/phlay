@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
 
-from http.client import HTTPSConnection
-from urllib.parse import urlencode, urlparse
-from subprocess import check_output, check_call, CalledProcessError
-from argparse import ArgumentParser
-from tempfile import TemporaryDirectory
-from pathlib import Path
 import sys
 import os
 import re
@@ -14,7 +8,14 @@ import curses
 import base64
 import socket
 import difflib
+
+from http.client import HTTPSConnection
+from urllib.parse import urlencode, urlparse
+from subprocess import check_output, check_call, CalledProcessError
+from argparse import ArgumentParser
+from tempfile import TemporaryDirectory
 from collections import namedtuple
+from pathlib import Path
 from enum import Enum
 
 
@@ -382,6 +383,7 @@ class Cached:
 
 class Revision(Cached):
     _info = None
+    DEP_SPEC = re.compile(r'Depends\s+On\s*D([0-9]+)', re.I)
 
     def init(self, revid):
         self.revid = int(revid)
@@ -392,6 +394,15 @@ class Revision(Cached):
                 'ids': [self.revid]
             }, attachments={'reviewers': True})
         return self._info
+
+    def summary(self, conduit):
+        return self.DEP_SPEC.sub(
+            '', self.info(conduit)['fields']['summary'], count=1
+        ).strip()
+
+    def depends_on(self, conduit):
+        dep = self.DEP_SPEC.match(self.info(conduit)['fields']['summary'])
+        return Revision(dep.group(1)) if dep else None
 
     def url(self, conduit):
         return f"https://{conduit.url.netloc}/D{self.revid}"
@@ -406,8 +417,7 @@ class Bug(Cached):
     def info(self, _conduit):
         if self._info is None:
             conn = HTTPSConnection('bugzilla.mozilla.org')
-            conn.request('GET',
-                f"/rest/bug/{self.bugno}?include_fields=summary,status")
+            conn.request('GET', f"/rest/bug/{self.bugno}")
             resp = json.load(conn.getresponse())
             if resp.get('error', False):
                 raise UserError(resp['message'])
@@ -519,22 +529,13 @@ class Commit(Cached):
         self.hg_hash = check_output([
             'git', 'cinnabar', 'git2hg', self.commit_hash
         ]).decode().strip()
-        if self.hg_hash == NULL_SHA1:
-            self.hg_hash = None
-
-        # We can /guess/ whether or not a commit is "public" (pushed to inbound)
-        # based on whether or not it has a cached hg_hash. non-"public" commits
-        # will have a null hg_hash, which is filled in during ensure_hg_hashes.
-        #
-        # Commits with revision IDs are also public.
-        self.is_public = self.hg_hash is not None or self.revision is not None
 
     def parent(self):
         if len(self.parent_hashes) == 1:
             return Commit(self.parent_hashes[0])
         return None
 
-    def get_diff(self):
+    def diff(self):
         if not self._diff:
             self._diff = Diff(self)
         return self._diff
@@ -544,12 +545,6 @@ class Commit(Cached):
             'type': type,
             'value': value,
         })
-
-    def new_summary(self, parent):
-        if parent is None:
-            return self.summary
-        revid = parent.revision.revid if parent.revision else '<pending>'
-        return f"{self.summary}\n\nDepends on D{revid}".strip()
 
     def recommit(self, parent, message):
         message = message.strip()  # Make sure to clean up trailing whitespace
@@ -586,7 +581,7 @@ def ensure_hg_hashes(commits):
     # which does.
     to_hg = []
     current = commits[0].parent()
-    while not (current and current.hg_hash):
+    while not (current and current.hg_hash != NULL_SHA1):
         if current is None:
             raise UserError(f'no direct mercurial ancestor!')
         to_hg.append(current)
@@ -641,7 +636,7 @@ def ensure_hg_hashes(commits):
 
     # Apply the computed hg_ptoc map to add mercurial hashes
     for commit in to_hg:
-        assert commit.parent().hg_hash is not None
+        assert commit.parent().hg_hash != NULL_SHA1
         commit.hg_hash = hg_ptoc[commit.parent().hg_hash]
 
 
@@ -717,23 +712,29 @@ def process_args(args):
 
         # Determine which revision we're working with
         if commit.revision is None:
-            revinfo = {}
-            label('Revision', '<<new>>')
+            buginfo = commit.bug.info(conduit)
+            label('New Revision', f"""\
+{style.bold('Bug ' + str(commit.bug.bugno))} {buginfo['status']} {buginfo['resolution']}
+  {buginfo['summary']}
+  {style.bold('Assigned To')} {buginfo['assigned_to_detail']['real_name']}
+{style.bold('Repository')} {conduit.repository['fields']['name']}""")
+
+            commit.add_transaction('repositoryPHID', conduit.repository['phid'])
+            commit.add_transaction('bugzilla.bug-id', str(commit.bug.bugno))
         else:
             revinfo = commit.revision.info(conduit)
-            label('Revision', commit.revision.url(conduit))
-        revfields = revinfo.get('fields', {})
+            revfields = revinfo['fields']
+            label('Update Revision', commit.revision.url(conduit))
 
-        # Specify which repository we're working with
-        oldrepo = revfields.get('repositoryPHID')
-        if not oldrepo:
-            commit.add_transaction('repositoryPHID', conduit.repository['phid'])
-            label('Repository', conduit.repository['fields']['name'])
-        elif oldrepo != conduit.repository['phid']:
-            raise UserError('specified revision for incorrect repository!')
+            if revfields['repositoryPHID'] != conduit.repository['phid']:
+                raise UserError('mismatched revision repository ' +
+                                revfields['repositoryPHID'])
+            if revfields['bugzilla.bug-id'] != str(commit.bug.bugno):
+                raise UserError('mismatched bug # ' +
+                                revfields['bugzilla.bug-id'])
 
         # Log computed information about the patch to be pushed
-        diff = commit.get_diff()
+        diff = commit.diff()
         summary = ''
         longest = max(len(name) for name in diff.changes)
         for path, change in diff.changes.items():
@@ -744,33 +745,35 @@ def process_args(args):
         label('Changes', summary)
 
         # Title Updates
-        oldtitle = revfields.get('title')
-        if oldtitle != commit.subject:
+        if not commit.revision or revinfo['fields']['title'] != commit.subject:
             commit.add_transaction('title', commit.subject)
             label('Set Title', commit.subject)
 
-        # Summary Generation
-        oldsummary = revfields.get('summary')
-        summary = commit.new_summary(commit.parent() if idx > 0 else None)
-        if oldsummary != summary:
-            commit.add_transaction('summary', summary)
-            label('Set Summary', summary)
+        # Summary Updates
+        oldsummary = commit.revision and commit.revision.summary(conduit)
+        if oldsummary != commit.summary:
+            commit.add_transaction('summary', commit.summary)
+            label('Set Summary', commit.summary)
 
-        # Update the Bug #
-        buginfo = commit.bug.info(conduit)
-        oldbugno = revfields.get('bugzilla.bug-id')
-        if oldbugno != str(commit.bug.bugno):
-            commit.add_transaction('bugzilla.bug-id', str(commit.bug.bugno))
-            label('Set Bug', f"Bug {commit.bug.bugno}",
-                  style.bold(f"[{buginfo['status']}]"), f"{buginfo['summary']}")
+        # Do some validation on dependencies
+        olddepends = commit.revision and commit.revision.depends_on(conduit)
+        if olddepends:
+            # Check for attempts to change the dependency graph
+            if idx == 0:
+                raise UserError(f"parent D{olddepends.id} not in push")
+            elif commit.parent.revision != olddepends:
+                raise UserError(f"phlay can't change parent D{olddepends.id}")
+        elif idx > 0 and oldsummary == commit.summary:
+            # Force a summary change if a dependency add is needed
+            commit.add_transaction('summary', commit.summary)
 
         # Add any reviewers not in the original commit
         to_add = []
-        rev_phids = [
-            reviewer['reviewerPHID']
-            for reviewer in revinfo.get('attachments', {})
-                .get('reviewers', {}).get('reviewers', [])
-        ]
+        rev_phids = []
+        if commit.revision:
+            reviewers = revinfo['attachments']['reviewers']['reviewers']
+            rev_phids = [reviewer['reviewerPHID'] for reviewer in reviewers]
+
         for reviewer in commit.reviewers:
             reviewerinfo = reviewer.info(conduit)
             if reviewerinfo['phid'] not in rev_phids:
@@ -794,9 +797,9 @@ def process_args(args):
 
     # Perform all uploads, and then publish all patches.
     for commit in push:
-        commit.get_diff().do_uploads(style, conduit)
+        commit.diff().do_uploads(style, conduit)
     for commit in push:
-        phid = commit.get_diff().do_publish(style, conduit)
+        phid = commit.diff().do_publish(style, conduit)
         commit.add_transaction('update', phid)
 
     # Perform the commit rewriting
@@ -804,10 +807,13 @@ def process_args(args):
     for idx, commit in enumerate(push):
         print(style.bold_yellow(f"Requesting Review"), f"{commit.summary}")
 
-        # Update transactions to reflect parent pushed revIDs
-        for txn in commit.transactions:
-            if txn['type'] == 'summary':
-                txn['value'] = commit.new_summary(parent if idx > 0 else None)
+        # Add a 'Depends on' entry to the transaction if needed
+        if idx > 0:
+            for txn in commit.transactions:
+                if txn['type'] == 'summary':
+                    txn['value'] += "\n\nDepends on " + parent.revision.revid
+                    txn['value'] = txn['value'].strip()
+                    break
 
         # Send the revision edit request.
         params = {'transactions': commit.transactions}
