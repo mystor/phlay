@@ -1,21 +1,35 @@
 #!/usr/bin/env python3
 
-from http.client import HTTPSConnection
-from urllib.parse import urlencode, urlparse
-from subprocess import check_output
-from argparse import ArgumentParser
-from pathlib import Path
 import sys
 import os
 import re
 import json
 import curses
+import base64
+import socket
+import difflib
+import mimetypes
+
+from http.client import HTTPSConnection
+from urllib.parse import urlencode, urlparse
+from subprocess import check_output, check_call, CalledProcessError
+from argparse import ArgumentParser
+from tempfile import TemporaryDirectory
+from collections import namedtuple
+from pathlib import Path
+from enum import Enum
+
+
+NULL_SHA1 = '0' * 40
 
 
 class Style:
     """ANSI color helper"""
-    COLORS = 'black blue cyan green magenta red white yellow'.split()
-    SUGAR = dict(reset='sgr0', italic='sitm')
+    class Wrap(str):
+        def __call__(self, s):
+            if self == '':
+                return str(s)
+            return self + str(s) + curses.tparm(curses.tigetstr('sgr0')).decode()
 
     def __init__(self, color, stream=sys.stdout):
         self.styled = color == 'always' or (color == 'auto' and stream.isatty())
@@ -26,11 +40,12 @@ class Style:
     def __getattr__(self, name):
         if not self.styled:
             return ''
-        name = self.SUGAR.get(name, name)
-        if name in self.COLORS:
-            num = getattr(curses, 'COLOR_' + name.upper())
-            return curses.tparm(self._setf, num).decode('latin1')
-        return curses.tparm(curses.tigetstr(name)).decode('latin1')
+        if '_' in name:
+            return self.Wrap(''.join(getattr(self, n) for n in name.split('_')))
+        call = [curses.tigetstr(name)]
+        if name in 'black blue cyan green magenta red white yellow'.split():
+            call = [self._setf, getattr(curses, 'COLOR_' + name.upper())]
+        return self.Wrap(curses.tparm(*call).decode())
 
 
 class UserError(Exception):
@@ -44,8 +59,6 @@ class Conduit:
                         .decode().strip())
         with open(self.top / '.arcconfig') as f:
             arcconfig = json.load(f)
-        with open(Path(arcrc_path).expanduser()) as f:
-            arcrc = json.load(f)
 
         # Load the URL from the local arcconfig
         self.url = urlparse(arcconfig['phabricator.uri'])
@@ -53,19 +66,41 @@ class Conduit:
             raise UserError('Only HTTPS scheme phabricator.uri are supported')
 
         # Find our authentication token
+        arcrc_path = Path(arcrc_path).expanduser()
+        arcrc = {}
         try:
+            with open(arcrc_path) as f:
+                arcrc = json.load(f)
+
             self.token = next(data['token'] for url, data in arcrc['hosts'].items()
                               if urlparse(url).netloc == self.url.netloc)
-        except:
-            raise UserError(f'No token for host {self.url.netloc}')
+        except (IOError, StopIteration):
+            self.token = input(f"""\
+LOGIN TO PHABRICATOR
+
+Open this page in your browser, and login if necessary:
+https://{self.url.netloc}/conduit/login
+
+API Token from that page: """).strip()
+
+            # Double-check the token works
+            self.do('user.whoami')
+
+            # Update our arcrc
+            api_uri = f"https://{self.url.netloc}/api/"
+            arcrc['hosts'] = arcrc.get('hosts', {})
+            arcrc['hosts'][api_uri] = arcrc['hosts'].get(api_uri, {})
+            arcrc['hosts'][api_uri]['token'] = self.token
+            with open(arcrc_path, 'w') as f:
+                json.dump(arcrc, f, indent=2)
 
         # Connect to Conduit to determine our repository's PHID
-        self.callsign = arcconfig['repository.callsign']
         self.repository = self.search_one('diffusion.repository', {
             'callsigns': [arcconfig['repository.callsign']]
         })
+        self.hostname = socket.gethostname()
 
-    def do(self, name, **params):
+    def do(self, cmd_name, **params):
         # Add the token & write out parameters.
         params['__conduit__'] = { 'token': self.token }
         body = urlencode({
@@ -76,7 +111,7 @@ class Conduit:
 
         # Send the POST request
         conn = HTTPSConnection(self.url.netloc)
-        conn.request("POST", f'/api/{name}', body=body)
+        conn.request("POST", f'/api/{cmd_name}', body=body)
 
         # Read the response as JSON
         resp = json.load(conn.getresponse())
@@ -92,6 +127,291 @@ class Conduit:
         if len(resp['data']) != 1:
             raise UserError(f'cannot find {what} (constraints={constraints})')
         return resp['data'][0]
+
+
+class Diff:
+    Hunk = namedtuple('Hunk', ['old_off', 'old_len', 'new_off', 'new_len',
+                               'added', 'deleted', 'corpus'])
+
+    class Change:
+        def __init__(self, path):
+            self.old_mode = None
+            self.cur_mode = None
+            self.old_path = None
+            self.cur_path = path
+            self.away_paths = []
+            self.kind = Diff.Kind.CHANGE
+            self.binary = False
+            self.file_type = Diff.FileType.TEXT
+            self.uploads = []
+            self.hunks = []
+
+        @property
+        def added(self):
+            return sum(hunk.added for hunk in self.hunks)
+
+        @property
+        def deleted(self):
+            return sum(hunk.deleted for hunk in self.hunks)
+
+        def to_conduit(self, commit):
+            # Record upload information
+            metadata = {}
+            for upload in self.uploads:
+                metadata[f'{upload["type"]}:binary-phid'] = upload['phid']
+                metadata[f'{upload["type"]}:file:size'] = len(upload['value'])
+                metadata[f'{upload["type"]}:file:mime-type'] = upload['mime']
+
+            # Translate hunks
+            hunks = [{
+                'oldOffset': hunk.old_off,
+                'oldLength': hunk.old_len,
+                'newOffset': hunk.new_off,
+                'newLength': hunk.new_len,
+                # isMissingOldNewline
+                # isMissingNewNewline
+                'corpus': hunk.corpus,
+            } for hunk in self.hunks]
+
+            old_props = {'unix:filemode': self.old_mode} if self.old_mode else {}
+            cur_props = {'unix:filemode': self.cur_mode} if self.cur_mode else {}
+
+            added = sum(hunk.added for hunk in self.hunks)
+            deleted = sum(hunk.deleted for hunk in self.hunks)
+
+            return {
+                'metadata': metadata,
+                'oldPath': self.old_path,
+                'currentPath': self.cur_path,
+                'awayPaths': self.away_paths,
+                'oldProperties': old_props,
+                'newProperties': cur_props,
+                'commitHash': commit.hg_hash,
+                'type': self.kind.value,
+                'fileType': self.file_type.value,
+                'hunks': hunks,
+            }
+
+    class Kind(Enum):
+        ADD = 1
+        CHANGE = 2
+        DELETE = 3
+        MOVE_AWAY = 4
+        COPY_AWAY = 5
+        MOVE_HERE = 6
+        COPY_HERE = 7
+        MULTICOPY = 8
+
+        def short(self):
+            if self == self.ADD:
+                return 'A '
+            elif self == self.CHANGE:
+                return 'M '
+            elif self == self.DELETE:
+                return 'D '
+            elif self == self.MOVE_AWAY:
+                return 'R>'
+            elif self == self.MOVE_HERE:
+                return '>R'
+            elif self == self.COPY_AWAY:
+                return 'C>'
+            elif self == self.COPY_HERE:
+                return '>C'
+            elif self == self.MULTICOPY:
+                return 'C*'
+
+
+    class FileType(Enum):
+        TEXT = 1
+        IMAGE = 2 # XXX(nika): Generate this sometimes?
+        BINARY = 3
+        DIRECTORY = 4 # Should never show up...
+        SYMLINK = 5 # XXX(nika): Support symlinks (do we care?)?
+        DELETED = 6
+        NORMAL = 7
+
+    def __init__(self, commit):
+        self.commit = commit
+        self.changes = {}
+        self.phid = None
+
+        raw = check_output(['git', 'diff-tree', '-r', '--raw', '-z', '-M', '-C',
+                            '--no-abbrev', commit.commit_hash]).decode()
+        # Strip the prefix sha1, and remove the trailing null
+        for c in raw[:-1].split('\0:')[1:]:
+            self.parse_change(c)
+
+    @property
+    def added(self):
+        return sum(change.added for change in self.changes.values())
+
+    @property
+    def deleted(self):
+        return sum(change.deleted for change in self.changes.values())
+
+    def change_for(self, path):
+        if path not in self.changes:
+            self.changes[path] = self.Change(path)
+        return self.changes[path]
+
+    def parse_change(self, raw):
+        """Parse a single raw change into a Change object"""
+        # `--raw -z` only uses '\0' to split paths, other sections are still
+        # space-separated.
+        [fields, *paths] = raw.split('\0')
+        [a_mode, b_mode, a_blob, b_blob, kind_l] = fields.split(' ')
+
+        # Figure out what paths and modes to use
+        if len(paths) == 2:
+            [a_path, b_path] = paths
+        else:
+            a_path = b_path = paths[0]
+        change = self.change_for(b_path)
+
+        # Extract the bodies of blobs to compare
+        a_body, b_body = b'', b''
+        if a_blob != NULL_SHA1:
+            a_body = check_output(['git', 'cat-file', 'blob', a_blob])
+        if b_blob != NULL_SHA1:
+            b_body = check_output(['git', 'cat-file', 'blob', b_blob])
+
+        # Detect if we're binary, and generate a unified diff
+        change.binary = b'\0' in a_body or b'\0' in b_body
+        if change.binary:
+            a_mime = mimetypes.guess_type(a_path)[0] or ''
+            b_mime = mimetypes.guess_type(b_path)[0] or ''
+            change.uploads = [
+                {'type': 'old', 'value': a_body, 'mime': a_mime, 'phid': None},
+                {'type': 'new', 'value': b_body, 'mime': b_mime, 'phid': None},
+            ]
+            if a_mime.startswith('image/') or b_mime.startswith('image/'):
+                change.file_type = self.FileType.IMAGE
+            else:
+                change.file_type = self.FileType.BINARY
+        elif a_blob == b_blob:
+            # Identical blobs have no diff, and thus get a fake hunk.
+            lines = a_body.decode().splitlines()
+            change.hunks = [self.Hunk(
+                old_off=1, old_len=len(lines),
+                new_off=1, new_len=len(lines),
+                added=0, deleted=0,
+                corpus='\n'.join(f" {l}" for l in lines),
+            )]
+            change.file_type = self.FileType.TEXT
+        else:
+            # Generate the diff using difflib
+            [hdr, *corpus] = list(difflib.unified_diff(
+                a_body.decode().splitlines(),
+                b_body.decode().splitlines(),
+                n=99999999,
+            ))[2:]
+
+            # Match on the hunk line
+            m = re.match(r'@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@', hdr, re.I)
+            change.hunks = [self.Hunk(
+                old_off=int(m.group(1)), old_len=int(m.group(2) or 1),
+                new_off=int(m.group(3)), new_len=int(m.group(4) or 1),
+                added=sum(1 for l in corpus if l[0] == '+'),
+                deleted=sum(1 for l in corpus if l[0] == '-'),
+                corpus='\n'.join(corpus),
+            )]
+            change.file_type = self.FileType.TEXT
+
+        # Determine the correct kind from the letter
+        if kind_l[0] == 'A':
+            change.kind = self.Kind.ADD
+            change.new_mode = b_mode
+
+        elif kind_l[0] == 'D':
+            change.kind = self.Kind.DELETE
+            change.old_mode = a_mode
+
+        elif kind_l[0] == 'M':
+            change.kind = self.Kind.CHANGE
+            if a_mode != b_mode:
+                change.old_mode = a_mode
+                change.new_mode = b_mode
+
+        elif kind_l[0] == 'R':
+            change.kind = self.Kind.MOVE_HERE
+            if a_mode != b_mode:
+                change.old_mode = a_mode
+                change.new_mode = b_mode
+
+            change.old_path = a_path
+            old = self.change_for(change.old_path)
+            if old.kind in [self.Kind.MOVE_AWAY, self.Kind.COPY_AWAY]:
+                old.kind = self.Kind.MULTICOPY
+            elif old.kind != self.Kind.MULTICOPY:
+                old.kind = self.Kind.MOVE_AWAY
+            old.away_paths.append(change.cur_path)
+
+        elif kind_l[0] == 'C':
+            change.kind = self.Kind.COPY_HERE
+            if a_mode != b_mode:
+                change.old_mode = a_mode
+                change.new_mode = b_mode
+
+            change.old_path = a_path
+            old = self.change_for(change.old_path)
+            if old.kind == self.Kind.MOVE_AWAY:
+                old.kind = self.Kind.MULTICOPY
+            else:
+                old.kind = self.Kind.COPY_AWAY
+            old.away_paths.append(change.cur_path)
+
+        else:
+            raise f"unsupported change type {kind_l[0]}"
+
+        return change
+
+    def do_uploads(self, style, conduit):
+        for change in self.changes.values():
+            for upload in change.uploads:
+                print(style.bold_yellow('Uploading Binary'),
+                      f"{change.cur_path} [{upload['type']}] {upload['mime']}")
+                data_base64 = base64.standard_b64encode(upload['value'])
+                upload['phid'] = conduit.do('file.upload',
+                                            data_base64=data_base64.decode())
+                print(f"    File PHID: {upload['phid']}")
+
+    def do_publish(self, style, conduit):
+        print(style.bold_yellow('Publishing Patch'), f"{self.commit.subject}")
+        changes = [change.to_conduit(self.commit)
+                   for change in self.changes.values()]
+        diff = conduit.do('differential.creatediff',
+                          changes=changes,
+                          sourceMachine=conduit.hostname,
+                          sourceControlSystem='hg',
+                          sourceControlPath='/',
+                          sourceControlBaseRevision=self.commit.parent().hg_hash,
+                          creationMethod='phlay',
+                          lintStatus='none',
+                          unitStatus='none',
+                          repositoryPHID=conduit.repository['phid'],
+                          sourcePath=str(conduit.top),
+                          # XXX(nika): This seems kinda irrelevant?
+                          branch='HEAD')
+        print(f"    Diff URI: {diff['uri']}")
+
+        # Add information about our local commit to the patch. This info is
+        # needed by lando.
+        conduit.do('differential.setdiffproperty',
+                   diff_id=diff['diffid'],
+                   name='local:commits',
+                   data=json.dumps({
+                       self.commit.hg_hash: {
+                           'author': self.commit.author_name,
+                           'authorEmail': self.commit.author_email,
+                           'time': int(self.commit.unix_date),
+                           'summary': self.commit.subject,
+                           'message': self.commit.raw_body.strip(),
+                           'commit': self.commit.hg_hash,
+                           'tree': self.commit.tree_hash,
+                           'parents': [self.commit.parent().hg_hash],
+                       }
+                   }))
+        return diff['phid']
 
 
 class Cached:
@@ -117,6 +437,7 @@ class Cached:
 
 class Revision(Cached):
     _info = None
+    DEP_SPEC = re.compile(r'Depends\s+On\s*D([0-9]+)', re.I)
 
     def init(self, revid):
         self.revid = int(revid)
@@ -125,8 +446,17 @@ class Revision(Cached):
         if self._info is None:
             self._info = conduit.search_one('differential.revision', {
                 'ids': [self.revid]
-            }, attachments={ 'reviewers': True })
+            }, attachments={'reviewers': True})
         return self._info
+
+    def summary(self, conduit):
+        return self.DEP_SPEC.sub(
+            '', self.info(conduit)['fields']['summary'], count=1
+        ).strip()
+
+    def depends_on(self, conduit):
+        dep = self.DEP_SPEC.match(self.info(conduit)['fields']['summary'])
+        return Revision(dep.group(1)) if dep else None
 
     def url(self, conduit):
         return f"https://{conduit.url.netloc}/D{self.revid}"
@@ -141,8 +471,7 @@ class Bug(Cached):
     def info(self, _conduit):
         if self._info is None:
             conn = HTTPSConnection('bugzilla.mozilla.org')
-            conn.request('GET',
-                f"/rest/bug/{self.bugno}?include_fields=summary,status")
+            conn.request('GET', f"/rest/bug/{self.bugno}")
             resp = json.load(conn.getresponse())
             if resp.get('error', False):
                 raise UserError(resp['message'])
@@ -150,17 +479,28 @@ class Bug(Cached):
         return self._info
 
 
-class User(Cached):
+class Reviewer(Cached):
     _info = None
 
-    def init(self, username):
-        self.username = username
+    def init(self, tag):
+        self.tag = tag
 
     def info(self, conduit):
         if self._info is None:
-            self._info = conduit.search_one('user', {
-                'usernames': [self.username]
-            })
+            try:
+                # First, we try to locate a user with the reviewer's name.
+                self._info = conduit.search_one('user', {
+                    'usernames': [self.tag]
+                })
+            except UserError:
+                try:
+                    # Then we locate a project based on its slug.
+                    self._info = conduit.search_one('project', {
+                        'slugs': [self.tag]
+                    })
+                except UserError:
+                    raise UserError(f"no such reviewer: {self.tag}")
+
         return self._info
 
 
@@ -173,6 +513,7 @@ class Commit(Cached):
     author_name     = '%an'
     author_email    = '%ae'
     author_date     = '%aD'
+    unix_date       = '%at'
     committer_name  = '%cn'
     committer_email = '%ce'
     committer_date  = '%cD'
@@ -187,8 +528,8 @@ class Commit(Cached):
         return check_output(['git', 'rev-parse', '--verify', rev]).decode().strip()
 
     def init(self, rev):
-        # XXX(nika): Consider making this part lazy?
         self.transactions = []
+        self._diff = None
 
         # Read information from 'git show'
         FIELDS = { k: v for k, v in Commit.__dict__.items()
@@ -204,60 +545,47 @@ class Commit(Cached):
         self.bug = bugmatch and Bug(bugmatch.group(1))
 
         # Parse the reviewer list
+        reviewer_re = r'r((?:[?=,][^,\s]+)+)'
         self.reviewers = []
-        for rmatch in re.finditer(r'r((?:[?=,][^,\s]+)+)', self.subject, re.I):
+        for rmatch in re.finditer(reviewer_re, self.subject, re.I):
             for name in re.split(r'[?=,]', rmatch.group(1))[1:]:
-                self.reviewers.append(User(name))
+                self.reviewers.append(Reviewer(name))
 
         # Parse the revision out of body, and strip to store in summary.
         self.revision = None
         def rev_replace(match):
             self.revision = Revision(match.group(2))
             return ""
-        self._summary = re.sub(
+        self.summary = re.sub(
             r'^Differential\s+Revision:\s*(.*/)?D([0-9]+)$',
             rev_replace, self.body, count=1, flags=re.I | re.M
         ).strip()
+
+        self.title = re.sub(reviewer_re, '', self.subject, flags=re.I) \
+                       .strip(' ,.;')
+
+        # Check if this commit has a corresponding mercurial hash already
+        # computed and cached. If we don't, and we need it, we will compute it
+        # later in ensure_hg_hashes.
+        self.hg_hash = check_output([
+            'git', 'cinnabar', 'git2hg', self.commit_hash
+        ]).decode().strip()
 
     def parent(self):
         if len(self.parent_hashes) == 1:
             return Commit(self.parent_hashes[0])
         return None
 
-    def get_diff(self):
-        return check_output([
-            'git', 'diff-tree',
-            '--no-ext-diff',
-            '--no-textconv',
-            '--submodule=short',
-            '--no-color',
-            '--src-prefix=a/',
-            '--dst-prefix=b/',
-            '-U32767',
-            self.commit_hash
-        ]).decode()
+    def diff(self):
+        if not self._diff:
+            self._diff = Diff(self)
+        return self._diff
 
     def add_transaction(self, type, value):
         self.transactions.append({
             'type': type,
             'value': value,
         })
-
-    def is_part_one(self):
-        return self.parent() and self.bug != self.parent().bug
-
-    def summary(self, parent=None, pending_deps=False):
-        summary = self._summary
-        if not self.is_part_one():
-            parent = parent or self.parent()
-            if parent.revision:
-                revid = parent.revision.revid
-            elif pending_deps:
-                revid = "<pending>"
-            else:
-                raise UserError(f"no revision for {parent.abbrev}")
-            summary += f"\n\nDepends on D{revid}"
-        return summary.strip()
 
     def recommit(self, parent, message):
         message = message.strip()  # Make sure to clean up trailing whitespace
@@ -284,6 +612,75 @@ class Commit(Cached):
         return f'<commit {self.abbrev} {repr(self.subject)}>'
 
 
+def ensure_hg_hashes(commits):
+    """Ensures that the range of commits 'commits' all has valid mercurial
+    hashes. |commits| must be sorted, with the oldest commit at index |0|."""
+
+    # Determine the set of commits which we will make into mercurial commits.
+    # Cinnabar will complain if our base commit's parent doesn't have a
+    # precomputed mercurial hash, so we have to climb until we find a commit
+    # which does.
+    to_hg = []
+    current = commits[0].parent()
+    while not (current and current.hg_hash != NULL_SHA1):
+        if current is None:
+            raise UserError(f'no direct mercurial ancestor!')
+        to_hg.append(current)
+        current = current.parent()
+    to_hg.reverse()
+    to_hg += commits
+
+    # Map from mercurial parent commits to child commits.
+    hg_ptoc = {}
+
+    # Get cinnabar to export a bundle with the specified commits. This will
+    # determine the mercurial hashes for those commits. We then parse the v1
+    # bundle format to extract relevant sha1 values.
+    with TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, 'bundle.hg')
+
+        # XXX(nika): This is probably the slowest part of phlay. Perhaps we could
+        # run it in parallel with the other network/io code (e.g. using asyncio)?
+        # We don't need the information until after you approve selected commits.
+        check_call(['git', 'cinnabar', 'bundle',
+                    '--version', '1', path,
+                    f"{current.commit_hash}..{to_hg[-1].commit_hash}"])
+
+        # The header of each chunk is 84 bytes long (4 bytes of length, 4x20
+        # bytes of sha1 hashes).
+        CHUNK_HEADER = 84
+
+        with open(path, 'rb') as f:
+            # Check the bundle type is an uncompressed v1 bundle.
+            assert f.read(6) == b'HG10UN', "bad bundle type"
+
+            while True:
+                # Read the size of the current section. A size too small to fit
+                # a header means we're done.
+                length = int.from_bytes(f.read(4), byteorder='big')
+                if length <= CHUNK_HEADER:
+                    break
+
+                # Read the header, containing 4x sha1 hashes, and skip the
+                # remaining data.
+                node = f.read(20).hex()
+                parent1 = f.read(20).hex()
+                parent2 = f.read(20).hex()
+                changeset = f.read(20).hex()
+                f.read(length - CHUNK_HEADER)
+
+                assert parent2 == NULL_SHA1, "Should have 1 parent"
+                assert changeset == node, "Changeset should match node"
+
+                # Stash the parent-to-child mapping
+                hg_ptoc[parent1] = node
+
+    # Apply the computed hg_ptoc map to add mercurial hashes
+    for commit in to_hg:
+        assert commit.parent().hg_hash != NULL_SHA1
+        commit.hg_hash = hg_ptoc[commit.parent().hg_hash]
+
+
 def get_revisions(args):
     # Check our 'ref' argument
     if args.ref != 'HEAD':
@@ -299,7 +696,10 @@ def get_revisions(args):
 
     # Determine which commits to reparent vs. push
     if '..' in args.revspec:
-        start, end = map(Commit, args.revspec.split('..', 1))
+        start, end = args.revspec.split('..', 1)
+        if len(end) == 0:
+            end = 'HEAD'
+        start, end = Commit(start), Commit(end)
     else:
         end = Commit(args.revspec)
         start = end.parent()
@@ -336,20 +736,19 @@ def process_args(args):
     # Stash the current sha1 for |ref|
     initial_ref = Commit(ref)
 
+    print(style.bold_yellow("Calculating Hg Changesets"))
+    # Ensure we have a mercurial hash for each commit we want to push.
+    ensure_hg_hashes(push)
+
     # Define a helper for printing styled & labeled information to stdout.
-    def label(label, *rest, warn=False):
-        color = style.bold + (style.red if warn else style.cyan)
-        body = ' '.join(str(s) for s in rest)
-        if '\n' in body:
-            indent = '\n    '
-            body = body.replace('\n', indent)
-        else:
-            indent = ' ' * (14 - len(label))
-        print(f"  {color}{label}{style.reset}{indent}{body}")
+    def label(label, *rest):
+        print('  ' + style.bold_cyan(label))
+        print('    ' + ' '.join(str(s) for s in rest).replace('\n', '\n    '))
 
     # Validate that everything exists, and show computed info
-    for commit in push:
-        print(f"{style.yellow}{commit.abbrev}{style.reset} {commit.subject}")
+    for idx, commit in enumerate(push):
+        print()
+        print(f"{style.yellow(commit.abbrev)} {commit.subject}")
 
         # Produce an error if no bug # was specified
         if commit.bug is None:
@@ -357,90 +756,110 @@ def process_args(args):
 
         # Determine which revision we're working with
         if commit.revision is None:
-            revinfo = {}
-            label('Revision', '<<new>>')
+            label('New Revision', conduit.repository['fields']['name'])
+
+            commit.add_transaction('repositoryPHID', conduit.repository['phid'])
+            commit.add_transaction('bugzilla.bug-id', str(commit.bug.bugno))
         else:
             revinfo = commit.revision.info(conduit)
-            label('Revision', commit.revision.url(conduit))
-        revfields = revinfo.get('fields', {})
+            revfields = revinfo['fields']
+            label('Update Revision', commit.revision.url(conduit))
 
-        # Specify which repository we're working with
-        oldrepo = revfields.get('repositoryPHID')
-        if not oldrepo:
-            commit.add_transaction('repositoryPHID', conduit.repository['phid'])
-            label('Repository', conduit.repository['fields']['name'])
-        elif oldrepo != conduit.repository['phid']:
-            raise UserError('specified revision for incorrect repository!')
+            if revfields['repositoryPHID'] != conduit.repository['phid']:
+                raise UserError('mismatched revision repository ' +
+                                revfields['repositoryPHID'])
+            if revfields['bugzilla.bug-id'] != str(commit.bug.bugno):
+                raise UserError('mismatched bug # ' +
+                                revfields['bugzilla.bug-id'])
+
+        # Always write out basic bug info
+        buginfo = commit.bug.info(conduit)
+        label(f"Bug {commit.bug.bugno}", buginfo['summary'])
+
+        # Log computed information about the patch to be pushed
+        diff = commit.diff()
+        summary = ''
+        longest = max(len(name) for name in diff.changes)
+        for path, change in diff.changes.items():
+            summary += f"{change.kind.short()} {path:<{longest}} "
+            summary += style.bold(f"+{change.added}, -{change.deleted}\n")
+        summary += style.bold(f"{len(diff.changes)} files")
+        summary += style.bold(f" (+{diff.added}, -{diff.deleted})")
+        label('Changes', summary)
 
         # Title Updates
-        oldtitle = revfields.get('title')
-        if oldtitle != commit.subject:
-            commit.add_transaction('title', commit.subject)
-            label('Set Title', commit.subject)
+        if not commit.revision or revinfo['fields']['title'] != commit.title:
+            commit.add_transaction('title', commit.title)
+            label('Set Title', commit.title)
 
-        # Summary Generation
-        oldsummary = revfields.get('summary')
-        summary = commit.summary(pending_deps=commit.parent() in push)
-        if oldsummary != summary:
-            commit.add_transaction('summary', summary)
-            label('Set Summary', summary)
+        # Summary Updates
+        oldsummary = commit.revision and commit.revision.summary(conduit)
+        if oldsummary != commit.summary:
+            commit.add_transaction('summary', commit.summary)
+            label('Set Summary', commit.summary)
 
-        # Update the Bug #
-        buginfo = commit.bug.info(conduit)
-        oldbugno = revfields.get('bugzilla.bug-id')
-        if oldbugno != str(commit.bug.bugno):
-            commit.add_transaction('bugzilla.bug-id', str(commit.bug.bugno))
-            label('Set Bug',
-                  f"Bug {commit.bug.bugno}",
-                  f"{style.bold}[{buginfo['status']}]{style.reset}",
-                  f"{style.italic}{buginfo['summary']}{style.reset}")
+        # Do some validation on dependencies
+        olddepends = commit.revision and commit.revision.depends_on(conduit)
+        if olddepends:
+            # Check for attempts to change the dependency graph
+            if idx == 0:
+                raise UserError(f"parent D{olddepends.id} not in push")
+            elif commit.parent.revision != olddepends:
+                raise UserError(f"phlay can't change parent D{olddepends.id}")
+        elif idx > 0 and oldsummary == commit.summary:
+            # Force a summary change if a dependency add is needed
+            commit.add_transaction('summary', commit.summary)
 
         # Add any reviewers not in the original commit
         to_add = []
-        rev_phids = [
-            reviewer['reviewerPHID']
-            for reviewer in revinfo.get('attachments', {})
-                .get('reviewers', {}).get('reviewers', [])
-        ]
+        rev_phids = []
+        if commit.revision:
+            reviewers = revinfo['attachments']['reviewers']['reviewers']
+            rev_phids = [reviewer['reviewerPHID'] for reviewer in reviewers]
+
         for reviewer in commit.reviewers:
-            userinfo = reviewer.info(conduit)
-            if userinfo['phid'] not in rev_phids:
-                to_add.append(userinfo['phid'])
-                label('Add Reviewer',
-                      userinfo['fields']['realName'],
-                      f"[:{userinfo['fields']['username']}]")
+            reviewerinfo = reviewer.info(conduit)
+            if reviewerinfo['phid'] not in rev_phids:
+                to_add.append(f"blocking({reviewerinfo['phid']})")
+                if reviewerinfo['type'] == 'USER':
+                    label('Add Reviewer',
+                          reviewerinfo['fields']['realName'],
+                          f"[:{reviewerinfo['fields']['username']}]")
+                elif reviewerinfo['type'] == 'PROJ':
+                    label('Add Reviewer',
+                          reviewerinfo['fields']['name'],
+                          f"[#{reviewer.tag}]")
         if len(to_add) > 0:
             commit.add_transaction('reviewers.add', to_add)
 
-        print()
-
     # Request user confirmation of printed information.
     if not args.assume_yes:
-        prompt_response = input(f"{style.bold}Proceed?{style.reset} (Y/n) ")
-        if prompt_response.lower() not in ('y', ''):
+        if input(style.bold('\nProceed? (y/N) ')).lower() != 'y':
             raise UserError('user aborted')
-        print()
+    print()
+
+    # Perform all uploads, and then publish all patches.
+    for commit in push:
+        commit.diff().do_uploads(style, conduit)
+    for commit in push:
+        phid = commit.diff().do_publish(style, conduit)
+        commit.add_transaction('update', phid)
 
     # Perform the commit rewriting
     parent = start
-    for commit in push:
-        print(f"{style.yellow}{commit.abbrev}{style.reset} {commit.subject}")
+    for idx, commit in enumerate(push):
+        print(style.bold_yellow(f"Requesting Review"), f"{commit.subject}")
 
-        # Update transactions to reflect parent pushed revIDs
-        for txn in commit.transactions:
-            if txn['type'] == 'summary':
-                txn['value'] = commit.summary(parent=parent)
-
-        # XXX(nika): Use 'differential.creatediff' instead to get full
-        # flexibility.
-        diff = conduit.do('differential.createrawdiff',
-                          diff=commit.get_diff(),
-                          repositoryPHID=conduit.repository['phid'])
-        label('Diff URI', diff['uri'])
-        commit.add_transaction('update', diff['phid'])
+        # Add a 'Depends on' entry to the transaction if needed
+        if idx > 0:
+            for txn in commit.transactions:
+                if txn['type'] == 'summary':
+                    txn['value'] += "\n\nDepends on " + parent.revision.revid
+                    txn['value'] = txn['value'].strip()
+                    break
 
         # Send the revision edit request.
-        params = { 'transactions': commit.transactions }
+        params = {'transactions': commit.transactions}
         if commit.revision is not None:
             params['objectIdentifier'] = commit.revision.info(conduit)['phid']
         editrv = conduit.do('differential.revision.edit', **params)
@@ -450,7 +869,7 @@ def process_args(args):
             revurl = Revision(editrv['object']['id']).url(conduit)
         else:
             revurl = commit.revision.url(conduit)
-        label('Revision', revurl)
+        print(f"    Revision URI: {revurl}")
 
         # Perform a rewrite of the commit, and move to the next
         commitmsg = commit.raw_body.strip()
@@ -464,10 +883,9 @@ def process_args(args):
 
     # Rewrite 'ref'
     if initial_ref != parent:
-        print(f"{style.bold}Updating {style.yellow}{ref}{style.reset}")
-        label('Old Value', initial_ref.commit_hash)
-        label('New Value', parent.commit_hash)
-        check_output([
+        print(style.bold_yellow(f"Updating Ref"), ref)
+        print(f"    {initial_ref.abbrev} => {parent.abbrev}")
+        check_call([
             'git', 'update-ref', '-m', 'phlay: rewrite',
             ref, parent.commit_hash, initial_ref.commit_hash,
         ])
@@ -492,8 +910,7 @@ def main():
         process_args(args)
     except UserError as e:
         style = Style(args.color, stream=sys.stderr)
-        print(f'{style.red}{style.bold}error{style.reset} {str(e)}',
-              file=sys.stderr)
+        print(style.bold_red('error'), e, file=sys.stderr)
         sys.exit(1)
 
 
