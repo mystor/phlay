@@ -8,6 +8,7 @@ import curses
 import base64
 import socket
 import difflib
+import mimetypes
 
 from http.client import HTTPSConnection
 from urllib.parse import urlencode, urlparse
@@ -158,7 +159,8 @@ class Diff:
             metadata = {}
             for upload in self.uploads:
                 metadata[f'{upload["type"]}:binary-phid'] = upload['phid']
-                metadata[f'{upload["type"]}:file-size'] = len(upload['value'])
+                metadata[f'{upload["type"]}:file:size'] = len(upload['value'])
+                metadata[f'{upload["type"]}:file:mime-type'] = upload['mime']
 
             # Translate hunks
             hunks = [{
@@ -185,8 +187,8 @@ class Diff:
                 'oldProperties': old_props,
                 'newProperties': cur_props,
                 'commitHash': commit.hg_hash,
-                'type': self.kind,
-                'fileType': self.file_type,
+                'type': self.kind.value,
+                'fileType': self.file_type.value,
                 'hunks': hunks,
             }
 
@@ -199,6 +201,25 @@ class Diff:
         MOVE_HERE = 6
         COPY_HERE = 7
         MULTICOPY = 8
+
+        def short(self):
+            if self == self.ADD:
+                return 'A '
+            elif self == self.CHANGE:
+                return 'M '
+            elif self == self.DELETE:
+                return 'D '
+            elif self == self.MOVE_AWAY:
+                return 'R>'
+            elif self == self.MOVE_HERE:
+                return '>R'
+            elif self == self.COPY_AWAY:
+                return 'C>'
+            elif self == self.COPY_HERE:
+                return '>C'
+            elif self == self.MULTICOPY:
+                return 'C*'
+
 
     class FileType(Enum):
         TEXT = 1
@@ -214,7 +235,7 @@ class Diff:
         self.changes = {}
         self.phid = None
 
-        raw = check_output(['git', 'diff-tree', '-r', '--raw', '-z',
+        raw = check_output(['git', 'diff-tree', '-r', '--raw', '-z', '-M', '-C',
                             '--no-abbrev', commit.commit_hash]).decode()
         # Strip the prefix sha1, and remove the trailing null
         for c in raw[:-1].split('\0:')[1:]:
@@ -257,14 +278,27 @@ class Diff:
         # Detect if we're binary, and generate a unified diff
         change.binary = b'\0' in a_body or b'\0' in b_body
         if change.binary:
+            a_mime = mimetypes.guess_type(a_path)[0] or ''
+            b_mime = mimetypes.guess_type(b_path)[0] or ''
             change.uploads = [
-                {'type': 'old', 'value': a_body, 'phid': None},
-                {'type': 'new', 'value': b_body, 'phid': None},
+                {'type': 'old', 'value': a_body, 'mime': a_mime, 'phid': None},
+                {'type': 'new', 'value': b_body, 'mime': b_mime, 'phid': None},
             ]
-            change.hunks = []
-            change.file_type = self.FileType.BINARY
+            if a_mime.startswith('image/') or b_mime.startswith('image/'):
+                change.file_type = self.FileType.IMAGE
+            else:
+                change.file_type = self.FileType.BINARY
+        elif a_blob == b_blob:
+            # Identical blobs have no diff, and thus get a fake hunk.
+            lines = a_body.decode().splitlines()
+            change.hunks = [self.Hunk(
+                old_off=1, old_len=len(lines),
+                new_off=1, new_len=len(lines),
+                added=0, deleted=0,
+                corpus='\n'.join(f" {l}" for l in lines),
+            )]
+            change.file_type = self.FileType.TEXT
         else:
-            change.uploads = []
             # Generate the diff using difflib
             [hdr, *corpus] = list(difflib.unified_diff(
                 a_body.decode().splitlines(),
@@ -273,10 +307,10 @@ class Diff:
             ))[2:]
 
             # Match on the hunk line
-            m = re.match(r'@@ -(\d+),(\d+) \+(\d+),(\d+) @@', hdr, re.I)
+            m = re.match(r'@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@', hdr, re.I)
             change.hunks = [self.Hunk(
-                old_off=int(m.group(1)), old_len=int(m.group(2)),
-                new_off=int(m.group(3)), new_len=int(m.group(4)),
+                old_off=int(m.group(1)), old_len=int(m.group(2) or 1),
+                new_off=int(m.group(3)), new_len=int(m.group(4) or 1),
                 added=sum(1 for l in corpus if l[0] == '+'),
                 deleted=sum(1 for l in corpus if l[0] == '-'),
                 corpus='\n'.join(corpus),
@@ -294,13 +328,15 @@ class Diff:
 
         elif kind_l[0] == 'M':
             change.kind = self.Kind.CHANGE
-            change.old_mode = a_mode
-            change.new_mode = b_mode
+            if a_mode != b_mode:
+                change.old_mode = a_mode
+                change.new_mode = b_mode
 
         elif kind_l[0] == 'R':
             change.kind = self.Kind.MOVE_HERE
-            change.old_mode = a_mode
-            change.new_mode = b_mode
+            if a_mode != b_mode:
+                change.old_mode = a_mode
+                change.new_mode = b_mode
 
             change.old_path = a_path
             old = self.change_for(change.old_path)
@@ -312,8 +348,9 @@ class Diff:
 
         elif kind_l[0] == 'C':
             change.kind = self.Kind.COPY_HERE
-            change.old_mode = a_mode
-            change.new_mode = b_mode
+            if a_mode != b_mode:
+                change.old_mode = a_mode
+                change.new_mode = b_mode
 
             change.old_path = a_path
             old = self.change_for(change.old_path)
@@ -331,15 +368,15 @@ class Diff:
     def do_uploads(self, style, conduit):
         for change in self.changes.values():
             for upload in change.uploads:
-                print(f"{style.yellow}{style.bold}Uploading Binary{style.reset}",
-                      f"{change.cur_path}")
+                print(style.bold_yellow('Uploading Binary'),
+                      f"{change.cur_path} [{upload['type']}] {upload['mime']}")
                 data_base64 = base64.standard_b64encode(upload['value'])
                 upload['phid'] = conduit.do('file.upload',
                                             data_base64=data_base64.decode())
                 print(f"    File PHID: {upload['phid']}")
 
     def do_publish(self, style, conduit):
-        print(style.bold_yellow('Publishing Patch'), f"{self.commit.summary}")
+        print(style.bold_yellow('Publishing Patch'), f"{self.commit.subject}")
         changes = [change.to_conduit(self.commit)
                    for change in self.changes.values()]
         diff = conduit.do('differential.creatediff',
@@ -367,8 +404,8 @@ class Diff:
                            'author': self.commit.author_name,
                            'authorEmail': self.commit.author_email,
                            'time': int(self.commit.unix_date),
-                           'summary': self.commit.summary,
-                           'message': self.commit.raw_body,
+                           'summary': self.commit.subject,
+                           'message': self.commit.raw_body.strip(),
                            'commit': self.commit.hg_hash,
                            'tree': self.commit.tree_hash,
                            'parents': [self.commit.parent().hg_hash],
@@ -744,10 +781,10 @@ def process_args(args):
         summary = ''
         longest = max(len(name) for name in diff.changes)
         for path, change in diff.changes.items():
-            summary += f"{path:<{longest}} "
+            summary += f"{change.kind.short()} {path:<{longest}} "
             summary += style.bold(f"+{change.added}, -{change.deleted}\n")
         summary += style.bold(f"{len(diff.changes)} files")
-        summary += f" (+{diff.added}, -{diff.deleted})"
+        summary += style.bold(f" (+{diff.added}, -{diff.deleted})")
         label('Changes', summary)
 
         # Title Updates
@@ -783,7 +820,7 @@ def process_args(args):
         for reviewer in commit.reviewers:
             reviewerinfo = reviewer.info(conduit)
             if reviewerinfo['phid'] not in rev_phids:
-                to_add.append(reviewerinfo['phid'])
+                to_add.append(f"blocking({reviewerinfo['phid']})")
                 if reviewerinfo['type'] == 'USER':
                     label('Add Reviewer',
                           reviewerinfo['fields']['realName'],
@@ -811,7 +848,7 @@ def process_args(args):
     # Perform the commit rewriting
     parent = start
     for idx, commit in enumerate(push):
-        print(style.bold_yellow(f"Requesting Review"), f"{commit.summary}")
+        print(style.bold_yellow(f"Requesting Review"), f"{commit.subject}")
 
         # Add a 'Depends on' entry to the transaction if needed
         if idx > 0:
@@ -846,8 +883,8 @@ def process_args(args):
 
     # Rewrite 'ref'
     if initial_ref != parent:
-        print(style.bold_yellow(f"Updating {ref}"))
-        print(f"  {initial_ref.abbrev} => {parent.abbrev}")
+        print(style.bold_yellow(f"Updating Ref"), ref)
+        print(f"    {initial_ref.abbrev} => {parent.abbrev}")
         check_call([
             'git', 'update-ref', '-m', 'phlay: rewrite',
             ref, parent.commit_hash, initial_ref.commit_hash,
