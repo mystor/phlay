@@ -73,7 +73,7 @@ class Conduit:
 
             self.token = next(data['token'] for url, data in arcrc['hosts'].items()
                               if urlparse(url).netloc == self.url.netloc)
-        except IOError, StopIteration:
+        except (IOError, StopIteration):
             self.token = input(f"""\
 LOGIN TO PHABRICATOR
 
@@ -329,7 +329,7 @@ class Diff:
         return change
 
     def do_uploads(self, style, conduit):
-        for change in self.change.values():
+        for change in self.changes.values():
             for upload in change.uploads:
                 print(f"{style.yellow}{style.bold}Uploading Binary{style.reset}",
                       f"{change.cur_path}")
