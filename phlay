@@ -854,7 +854,7 @@ def process_args(args):
         if idx > 0:
             for txn in commit.transactions:
                 if txn['type'] == 'summary':
-                    txn['value'] += "\n\nDepends on " + parent.revision.revid
+                    txn['value'] += f"\n\nDepends on {parent.revision.revid}"
                     txn['value'] = txn['value'].strip()
                     break
 
