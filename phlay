@@ -803,9 +803,9 @@ def process_args(args):
         if olddepends:
             # Check for attempts to change the dependency graph
             if idx == 0:
-                raise UserError(f"parent D{olddepends.id} not in push")
-            elif commit.parent.revision != olddepends:
-                raise UserError(f"phlay can't change parent D{olddepends.id}")
+                raise UserError(f"parent D{olddepends.revid} not in push")
+            elif commit.parent().revision != olddepends:
+                raise UserError(f"phlay can't change parent D{olddepends.revid}")
         elif idx > 0 and oldsummary == commit.summary:
             # Force a summary change if a dependency add is needed
             commit.add_transaction('summary', commit.summary)
