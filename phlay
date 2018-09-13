@@ -131,6 +131,7 @@ API Token from that page: """).strip()
 
 class Diff:
     Hunk = namedtuple('Hunk', ['old_off', 'old_len', 'new_off', 'new_len',
+                               'old_eof_newline', 'new_eof_newline',
                                'added', 'deleted', 'corpus'])
 
     class Change:
@@ -168,8 +169,8 @@ class Diff:
                 'oldLength': hunk.old_len,
                 'newOffset': hunk.new_off,
                 'newLength': hunk.new_len,
-                # isMissingOldNewline
-                # isMissingNewNewline
+                'isMissingOldNewline': not hunk.old_eof_newline,
+                'isMissingNewNewline': not hunk.new_eof_newline,
                 'corpus': hunk.corpus,
             } for hunk in self.hunks]
 
@@ -288,32 +289,54 @@ class Diff:
                 change.file_type = self.FileType.IMAGE
             else:
                 change.file_type = self.FileType.BINARY
-        elif a_blob == b_blob:
-            # Identical blobs have no diff, and thus get a fake hunk.
-            lines = a_body.decode().splitlines()
-            change.hunks = [self.Hunk(
-                old_off=1, old_len=len(lines),
-                new_off=1, new_len=len(lines),
-                added=0, deleted=0,
-                corpus='\n'.join(f" {l}" for l in lines),
-            )]
-            change.file_type = self.FileType.TEXT
         else:
-            # Generate the diff using difflib
-            [hdr, *corpus] = list(difflib.unified_diff(
-                a_body.decode().splitlines(),
-                b_body.decode().splitlines(),
-                n=99999999,
-            ))[2:]
+            # We can only diff non-identical blobs, otherwise we'll find no
+            # changes. Detect that case and produce an empty diff.
+            if a_blob == b_blob:
+                # Identical blobs have no diff, and thus get a fake hunk.
+                lines = a_body.decode().splitlines(keepends=True)
+                lines = [f" {l}" for l in lines]
+                old_off = new_off = 1
+                old_len = new_len = len(lines)
+            else:
+                # Use difflib to generate the base diff hunk, and match on the
+                # hunk line to extract offset and length info.
+                [hdr, *lines] = list(difflib.unified_diff(
+                    a_body.decode().splitlines(keepends=True),
+                    b_body.decode().splitlines(keepends=True),
+                    n=99999999,
+                ))[2:]
 
-            # Match on the hunk line
-            m = re.match(r'@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@', hdr, re.I)
+                m = re.match(r'@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@', hdr, re.I)
+                old_off = int(m.group(1))
+                old_len = int(m.group(2) or 1)
+                new_off = int(m.group(3))
+                new_len = int(m.group(4) or 1)
+
+            # Collect some stats about the diff, and generate the corpus we
+            # want to send to Phabricator. Python's `difflib` doesn't handle
+            # missing newlines well (https://bugs.python.org/issue2142), so we
+            # have to handle it manually.
+            old_eof_newline = True
+            new_eof_newline = True
+            corpus = ''
+            for line in lines:
+                corpus += line
+                if not line.endswith('\n'):
+                    corpus += '\n\\ No newline at end of file\n'
+                    if line[0] != '+':
+                        old_eof_newline = False
+                    if line[0] != '-':
+                        new_eof_newline = False
+
             change.hunks = [self.Hunk(
-                old_off=int(m.group(1)), old_len=int(m.group(2) or 1),
-                new_off=int(m.group(3)), new_len=int(m.group(4) or 1),
-                added=sum(1 for l in corpus if l[0] == '+'),
-                deleted=sum(1 for l in corpus if l[0] == '-'),
-                corpus='\n'.join(corpus),
+                old_off=old_off, old_len=old_len,
+                new_off=new_off, new_len=new_len,
+                old_eof_newline=old_eof_newline,
+                new_eof_newline=new_eof_newline,
+                added=sum(1 for l in lines if l[0] == '+'),
+                deleted=sum(1 for l in lines if l[0] == '-'),
+                corpus=corpus,
             )]
             change.file_type = self.FileType.TEXT
 
