@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+__version__ = '0.1.1'
+
 import sys
 import os
 import re
@@ -9,6 +11,7 @@ import base64
 import socket
 import difflib
 import mimetypes
+import textwrap
 
 from http.client import HTTPSConnection
 from urllib.parse import urlencode, urlparse
@@ -75,13 +78,13 @@ class Conduit:
             self.token = next(data['token'] for url, data in arcrc['hosts'].items()
                               if urlparse(url).netloc == self.url.netloc)
         except (IOError, StopIteration):
-            self.token = input(f"""\
-LOGIN TO PHABRICATOR
+            self.token = input(textwrap.dedent(f"""\
+                LOGIN TO PHABRICATOR
 
-Open this page in your browser, and login if necessary:
-https://{self.url.netloc}/conduit/login
+                Open this page in your browser, and login if necessary:
+                https://{self.url.netloc}/conduit/login
 
-API Token from that page: """).strip()
+                API Token from that page: """)).strip()
 
             # Double-check the token works
             self.do('user.whoami')
@@ -756,6 +759,11 @@ def get_revisions(args):
 def process_args(args):
     # Set up state for arguments
     style = Style(args.color)
+    try:
+        update_check(style)
+    except Exception as e:
+        print(style.red(f"Error checking for updates: {e}"), file=sys.stderr)
+
     conduit = Conduit(args.arcrc)
     start, ref, push, reparent = get_revisions(args)
 
@@ -917,8 +925,25 @@ def process_args(args):
         ])
 
 
+def update_check(style):
+    conn = HTTPSConnection('raw.githubusercontent.com')
+    conn.request('GET', '/mystor/phlay/master/phlay')
+    resp = conn.getresponse().read().decode()
+    match = re.search(r"__version__\s*=\s*'([^']+)'", resp, re.I)
+    new_version = match.group(1) if match else '0.1.0'
+    if new_version > __version__:
+        changes = f"RELEASES.md#version-{new_version.replace('.', '')}"
+        print(textwrap.dedent(f"""
+            {style.bold_yellow("NOTE: New Version Available")}
+             - phlay {__version__} => {new_version}
+             - https://github.com/mystor/phlay/blob/master/{changes}
+            """), file=sys.stderr)
+
+
 def main():
     parser = ArgumentParser(description='phlay commits onto differential')
+    parser.add_argument('--version', action='version',
+                        version=f"phlay {__version__}")
     parser.add_argument('--ref', '-r', nargs=1, default='HEAD',
                         help='git ref to update after rewriting commits')
     parser.add_argument('--assume-yes', '-y', action='store_true',
