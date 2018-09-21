@@ -594,9 +594,19 @@ class Commit(Cached):
         # Check if this commit has a corresponding mercurial hash already
         # computed and cached. If we don't, and we need it, we will compute it
         # later in ensure_hg_hashes.
-        self.hg_hash = check_output([
-            'git', 'cinnabar', 'git2hg', self.commit_hash
-        ]).decode().strip()
+        try:
+            self.hg_hash = check_output([
+                'git-cinnabar', 'git2hg', self.commit_hash
+            ]).decode().strip()
+
+            # If we don't have a valid cinnabar hash, fall-back. If
+            # '--hg-bundle' is passed, this will be corrected before pushing.
+            if self.hg_hash == NULL_SHA1:
+                self.hg_hash = self.commit_hash
+        except FileNotFoundError:
+            # Handle git-cinnabar being uninstalled
+            self.hg_hash = self.commit_hash
+
 
     def parent(self):
         if len(self.parent_hashes) == 1:
@@ -649,7 +659,7 @@ def ensure_hg_hashes(commits):
     # which does.
     to_hg = []
     current = commits[0].parent()
-    while not (current and current.hg_hash != NULL_SHA1):
+    while not (current and current.hg_hash != current.commit_hash):
         if current is None:
             raise UserError(f'no direct mercurial ancestor!')
         to_hg.append(current)
@@ -704,7 +714,7 @@ def ensure_hg_hashes(commits):
 
     # Apply the computed hg_ptoc map to add mercurial hashes
     for commit in to_hg:
-        assert commit.parent().hg_hash != NULL_SHA1
+        assert commit.parent().hg_hash != commit.parent().commit_hash
         commit.hg_hash = hg_ptoc[commit.parent().hg_hash]
 
 
@@ -769,9 +779,10 @@ def process_args(args):
     # Stash the current sha1 for |ref|
     initial_ref = Commit(ref)
 
-    print(style.bold_yellow("Calculating Hg Changesets"))
     # Ensure we have a mercurial hash for each commit we want to push.
-    ensure_hg_hashes(push)
+    if args.hg_bundle:
+        print(style.bold_yellow("Calculating Hg Changesets"))
+        ensure_hg_hashes(push)
 
     # Define a helper for printing styled & labeled information to stdout.
     def label(label, *rest):
@@ -952,8 +963,10 @@ def main():
     parser.add_argument('--color', default='auto', type=Style,
                         choices=['always', 'never', 'auto'],
                         help='control output colorization')
+    parser.add_argument('--hg-bundle', action='store_true',
+                        help='compute accurate mercurial hashes w/ cinnabar')
     parser.add_argument('revspec', nargs='?', default='HEAD',
-                        help='commit range to phlay onto differential')
+                        help='commit range to push for review')
     args = parser.parse_args()
 
     try:
