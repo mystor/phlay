@@ -12,6 +12,7 @@ import socket
 import difflib
 import mimetypes
 import textwrap
+import shlex
 
 from http.client import HTTPSConnection
 from urllib.parse import urlencode, urlparse
@@ -180,9 +181,6 @@ class Diff:
             old_props = {'unix:filemode': self.old_mode} if self.old_mode else {}
             cur_props = {'unix:filemode': self.cur_mode} if self.cur_mode else {}
 
-            added = sum(hunk.added for hunk in self.hunks)
-            deleted = sum(hunk.deleted for hunk in self.hunks)
-
             return {
                 'metadata': metadata,
                 'oldPath': self.old_path,
@@ -227,7 +225,7 @@ class Diff:
 
     class FileType(Enum):
         TEXT = 1
-        IMAGE = 2 # XXX(nika): Generate this sometimes?
+        IMAGE = 2
         BINARY = 3
         DIRECTORY = 4 # Should never show up...
         SYMLINK = 5 # XXX(nika): Support symlinks (do we care?)?
@@ -757,13 +755,14 @@ def get_revisions(args):
 
 
 def process_args(args):
-    # Set up state for arguments
-    style = Style(args.color)
+    style = args.color
     try:
         update_check(style)
     except Exception as e:
-        print(style.red(f"Error checking for updates: {e}"), file=sys.stderr)
+        print(style.red('warning'), f"checking for updates failed: {e}",
+              file=sys.stderr)
 
+    # Set up state for arguments
     conduit = Conduit(args.arcrc)
     start, ref, push, reparent = get_revisions(args)
 
@@ -950,7 +949,7 @@ def main():
                         help='disable confirmation prompts')
     parser.add_argument('--arcrc', nargs=1, default='~/.arcrc',
                         help='arc configuration file')
-    parser.add_argument('--color', default='auto',
+    parser.add_argument('--color', default='auto', type=Style,
                         choices=['always', 'never', 'auto'],
                         help='control output colorization')
     parser.add_argument('revspec', nargs='?', default='HEAD',
@@ -959,9 +958,15 @@ def main():
 
     try:
         process_args(args)
-    except UserError as e:
-        style = Style(args.color, stream=sys.stderr)
-        print(style.bold_red('error'), e, file=sys.stderr)
+    except KeyboardInterrupt:
+        print(args.color.bold_red('error'), 'interrupted', file=sys.stderr)
+        sys.exit(1)
+    except CalledProcessError as e:
+        pretty = ' '.join(shlex.quote(c) for c in e.cmd)
+        print(args.color.bold_red('error'), f"command failed: {pretty}",
+              file=sys.stderr)
+    except (UserError, FileNotFoundError) as e:
+        print(args.color.bold_red('error'), e, file=sys.stderr)
         sys.exit(1)
 
 
