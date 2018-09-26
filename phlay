@@ -43,7 +43,7 @@ class Style:
 
     def __getattr__(self, name):
         if not self.styled:
-            return ''
+            return self.Wrap('')
         if '_' in name:
             return self.Wrap(''.join(getattr(self, n) for n in name.split('_')))
         call = [curses.tigetstr(name)]
