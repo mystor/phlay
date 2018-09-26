@@ -29,6 +29,7 @@ NULL_SHA1 = '0' * 40
 
 class Style:
     """ANSI color helper"""
+
     class Wrap(str):
         def __call__(self, s):
             if self == '':
@@ -36,7 +37,8 @@ class Style:
             return self + str(s) + curses.tparm(curses.tigetstr('sgr0')).decode()
 
     def __init__(self, color, stream=sys.stdout):
-        self.styled = color == 'always' or (color == 'auto' and stream.isatty())
+        dumb = os.environ["TERM"] == "dumb"
+        self.styled = color == 'always' or (color == 'auto' and stream.isatty() and not dumb)
         if self.styled:
             curses.setupterm()
             self._setf = curses.tigetstr('setaf') or curses.tigetstr('setf')
