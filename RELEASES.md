@@ -1,3 +1,6 @@
+# Version 0.1.2
+* Preserve punctuation in commit messages for lando (#37, #38)
+
 # Version 0.1.1
 
 * Added '--version' flag and update checking
