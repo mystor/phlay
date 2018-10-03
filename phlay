@@ -590,8 +590,7 @@ class Commit(Cached):
             rev_replace, self.body, count=1, flags=re.I | re.M
         ).strip()
 
-        self.title = re.sub(reviewer_re, '', self.subject, flags=re.I) \
-                       .strip(' ,.;')
+        self.title = re.sub(reviewer_re, '', self.subject, flags=re.I).strip()
 
         # Check if this commit has a corresponding mercurial hash already
         # computed and cached. If we don't, and we need it, we will compute it
