@@ -1,3 +1,7 @@
+# Version 0.1.3
+* Send addLines/delLines info for hunks (#39)
+* Translate invalid utf-8 characters to replacement when generating diffs
+
 # Version 0.1.2
 * Preserve punctuation in commit messages for lando (#37, #38)
 
