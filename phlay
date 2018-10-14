@@ -175,6 +175,8 @@ class Diff:
                 'oldLength': hunk.old_len,
                 'newOffset': hunk.new_off,
                 'newLength': hunk.new_len,
+                'addLines': hunk.added,
+                'delLines': hunk.deleted,
                 'isMissingOldNewline': not hunk.old_eof_newline,
                 'isMissingNewNewline': not hunk.new_eof_newline,
                 'corpus': hunk.corpus,
