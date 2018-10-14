@@ -242,7 +242,7 @@ class Diff:
         self.phid = None
 
         raw = check_output(['git', 'diff-tree', '-r', '--raw', '-z', '-M', '-C',
-                            '--no-abbrev', commit.commit_hash]).decode()
+                            '--no-abbrev', commit.commit_hash]).decode(errors='replace')
         # Strip the prefix sha1, and remove the trailing null
         for c in raw[:-1].split('\0:')[1:]:
             self.parse_change(c)
@@ -299,7 +299,7 @@ class Diff:
             # changes. Detect that case and produce an empty diff.
             if a_blob == b_blob:
                 # Identical blobs have no diff, and thus get a fake hunk.
-                lines = a_body.decode().splitlines(keepends=True)
+                lines = a_body.decode(errors='replace').splitlines(keepends=True)
                 lines = [f" {l}" for l in lines]
                 old_off = new_off = 1
                 old_len = new_len = len(lines)
@@ -307,8 +307,8 @@ class Diff:
                 # Use difflib to generate the base diff hunk, and match on the
                 # hunk line to extract offset and length info.
                 [hdr, *lines] = list(difflib.unified_diff(
-                    a_body.decode().splitlines(keepends=True),
-                    b_body.decode().splitlines(keepends=True),
+                    a_body.decode(errors='replace').splitlines(keepends=True),
+                    b_body.decode(errors='replace').splitlines(keepends=True),
                     n=99999999,
                 ))[2:]
 
@@ -568,7 +568,7 @@ class Commit(Cached):
         FORMAT = '%x00'.join(FIELDS.values())
 
         info = check_output(['git', 'show', '-q', f'--format={FORMAT}', rev])
-        self.__dict__.update(zip(FIELDS.keys(), info.decode().split('\0')))
+        self.__dict__.update(zip(FIELDS.keys(), info.decode(errors='replace').split('\0')))
         self.parent_hashes = self.parent_hashes.split()
 
         # Compute more info based on the commit message etc.
