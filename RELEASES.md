@@ -1,3 +1,6 @@
+# Version 0.1.4
+* Support pushing patches for private/secure bugs better
+
 # Version 0.1.3
 * Send addLines/delLines info for hunks (#39)
 * Translate invalid utf-8 characters to replacement when generating diffs
