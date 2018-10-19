@@ -505,8 +505,11 @@ class Bug(Cached):
             conn.request('GET', f"/rest/bug/{self.bugno}")
             resp = json.load(conn.getresponse())
             if resp.get('error', False):
-                raise UserError(resp['message'])
-            self._info = resp['bugs'][0]
+                if resp['code'] != 102:  # Not an access error
+                    raise UserError(resp['message'])
+                self._info = {'summary': '<private bug>'}
+            else:
+                self._info = resp['bugs'][0]
         return self._info
 
 
