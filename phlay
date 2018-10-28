@@ -34,6 +34,28 @@ def run(*args, binary=False, **kwargs):
     return out.decode(errors='replace').rstrip()
 
 
+def http(host, path, data=None, binary=False):
+    conn = HTTPSConnection(host)
+    if data:
+        conn.request("POST", path, body=urlencode(data))
+    else:
+        conn.request("GET", path)
+    if binary:
+        return conn.getresponse().read()
+    return json.load(conn.getresponse())
+
+
+def onceprop(func):
+    cache = '_cached_' + func.__name__
+    def wrap(self):
+        try:
+            return getattr(self, cache)
+        except AttributeError:
+            setattr(self, cache, func(self))
+            return getattr(self, cache)
+    return property(wrap)
+
+
 class Style:
     """ANSI color helper"""
 
@@ -63,6 +85,10 @@ class Style:
 
 class UserError(Exception):
     pass
+
+
+def fatal(msg):
+    raise UserError(msg)
 
 
 class Conduit:
@@ -108,39 +134,32 @@ class Conduit:
                 json.dump(arcrc, f, indent=2)
 
         # Connect to Conduit to determine our repository's PHID
-        cls.repository = cls.search_one('diffusion.repository', {
-            'callsigns': [arcconfig['repository.callsign']]
-        })
+        callsign = arcconfig['repository.callsign']
+        cls.repository = (cls.lookup('diffusion.repository',
+                                     'callsign', callsign) or
+                          fatal(f"no repository {callsign}"))
         cls.hostname = socket.gethostname()
 
     @classmethod
     def do(cls, cmd_name, **params):
         # Add the token & write out parameters.
         params['__conduit__'] = {'token': cls.token}
-        body = urlencode({
+        resp = http(cls.url.netloc, f'/api/{cmd_name}', data={
             'params': json.dumps(params),
             'output': 'json',
             '__conduit__': True,
         })
-
-        # Send the POST request
-        conn = HTTPSConnection(cls.url.netloc)
-        conn.request("POST", f'/api/{cmd_name}', body=body)
-
-        # Read the response as JSON
-        resp = json.load(conn.getresponse())
         if resp['error_code'] is not None:
             raise UserError(f"conduit[{resp['error_code']}]: {resp['error_info']}")
         return resp['result']
 
     @classmethod
-    def search_one(cls, what, constraints, attachments={}):
+    def lookup(cls, what, key, value, attachments=[]):
         resp = cls.do(f'{what}.search',
-                      constraints=constraints,
-                      attachments=attachments,
-                      limit=1)
+                      constraints={f'{key}s': [value]},
+                      attachments={att: True for att in attachments})
         if len(resp['data']) != 1:
-            raise UserError(f'cannot find {what} (constraints={constraints})')
+            return None
         return resp['data'][0]
 
 
@@ -423,7 +442,7 @@ class Diff:
                           sourceMachine=Conduit.hostname,
                           sourceControlSystem='hg',
                           sourceControlPath='/',
-                          sourceControlBaseRevision=self.commit.parent().hg_hash,
+                          sourceControlBaseRevision=self.commit.parent.hg_hash,
                           creationMethod='phlay',
                           lintStatus='none',
                           unitStatus='none',
@@ -447,7 +466,7 @@ class Diff:
                            'message': self.commit.raw_body.strip(),
                            'commit': self.commit.hg_hash,
                            'tree': self.commit.tree_hash,
-                           'parents': [self.commit.parent().hg_hash],
+                           'parents': [self.commit.parent.hg_hash],
                        }
                    }))
         return diff['phid']
@@ -475,55 +494,52 @@ class Cached:
 
 
 class Revision(Cached):
-    _info = None
     dep_re = re.compile(r'Depends\s+On\s*D([0-9]+)', re.I)
 
     def init(self, revid):
         self.revid = int(revid)
 
-    @property
+    @onceprop
     def info(self):
-        if self._info is None:
-            self._info = Conduit.search_one('differential.revision', {
-                'ids': [self.revid]
-            }, attachments={'reviewers': True})
-        return self._info
+        return (Conduit.lookup('differential.revision', 'id', self.revid,
+                               attachments=['reviewers']) or
+                fatal(f"No such revision {self.revid}"))
 
-    @property
+    @onceprop
     def summary(self):
         return self.dep_re.sub('', self.raw_summary, count=1).strip()
 
-    @property
+    @onceprop
     def depends_on(self):
         dep = self.dep_re.match(self.raw_summary)
         return Revision(dep.group(1)) if dep else None
 
-    @property
+    @onceprop
     def phid(self):
         return self.info['phid']
 
-    @property
+    @onceprop
     def repo_phid(self):
         return self.info['fields']['repositoryPHID']
 
-    @property
+    @onceprop
     def bug(self):
         return Bug(self.info['fields']['bugzilla.bug-id'])
 
-    @property
+    @onceprop
     def title(self):
         return self.info['fields']['title']
 
-    @property
+    @onceprop
     def reviewers(self):
         infos = self.info['attachments']['reviewers']['reviewers']
         return [reviewer['reviewerPHID'] for reviewer in infos]
 
-    @property
+    @onceprop
     def raw_summary(self):
         return self.info['fields']['summary']
 
-    @property
+    @onceprop
     def url(self):
         return f"https://{Conduit.url.netloc}/D{self.revid}"
 
@@ -534,61 +550,41 @@ class Bug(Cached):
     def init(self, bugno):
         self.bugno = int(bugno)
 
-    @property
+    @onceprop
     def title(self):
-        if self._title is None:
-            conn = HTTPSConnection('bugzilla.mozilla.org')
-            conn.request('GET', f"/rest/bug/{self.bugno}")
-            resp = json.load(conn.getresponse())
-            if resp.get('error', False):
-                if resp['code'] != 102:  # Not an access error
-                    raise UserError(resp['message'])
-                self._title = '<private bug>'
-            else:
-                self._title = resp['bugs'][0]['summary']
-        return self._title
+        resp = http('bugzilla.mozilla.org', f'/rest/bug/{self.bugno}')
+        if resp.get('error', False):
+            if resp['code'] == 102:  # access error
+                return '<private bug>'
+            raise UserError(resp['message'])
+        return resp['bugs'][0]['summary']
 
 
 class Reviewer(Cached):
-    _info = None
-
     def init(self, tag):
         self.tag = tag
 
-    @property
+    @onceprop
     def info(self):
-        if self._info is None:
-            try:
-                # First, we try to locate a user with the reviewer's name.
-                self._info = Conduit.search_one('user', {
-                    'usernames': [self.tag]
-                })
-            except UserError:
-                try:
-                    # Then we locate a project based on its slug.
-                    self._info = Conduit.search_one('project', {
-                        'slugs': [self.tag]
-                    })
-                except UserError:
-                    raise UserError(f"no such reviewer: {self.tag}")
+        return (Conduit.lookup('user', 'username', self.tag) or
+                Conduit.lookup('project', 'slug', self.tag) or
+                fatal(f"no such reviewer: {self.tag}"))
 
-        return self._info
-
-    @property
+    @onceprop
     def kind(self):
         return self.info['type']
 
-    @property
+    @onceprop
     def phid(self):
         return self.info['phid']
 
-    @property
+    @onceprop
     def name(self):
         if self.kind == 'USER':
             return self.info['fields']['realName']
         return self.info['fields']['name']
 
-    @property
+    @onceprop
     def handle(self):
         if self.kind == 'USER':
             return ':' + self.info['fields']['username']
@@ -596,6 +592,8 @@ class Reviewer(Cached):
 
 
 class Commit(Cached):
+    reviewer_re = re.compile(r'r((?:[?=,][^,\s]+)+)', flags=re.I)
+
     # Fields pulled from 'git show'
     abbrev          = '%h'
     commit_hash     = '%H'
@@ -620,27 +618,15 @@ class Commit(Cached):
 
     def init(self, rev):
         self.transactions = []
-        self._diff = None
 
         # Read information from 'git show'
         FIELDS = {k: v for k, v in Commit.__dict__.items()
                   if type(v) == str and v.startswith('%')}
         FORMAT = '%x00'.join(FIELDS.values())
 
-        info = run('git', 'show', '-q', f'--format={FORMAT}', rev)
+        info = run('git', 'show', '-q', '--format=' + FORMAT, rev)
         self.__dict__.update(zip(FIELDS.keys(), info.split('\0')))
         self.parent_hashes = self.parent_hashes.split()
-
-        # Compute more info based on the commit message etc.
-        bugmatch = re.search(r'bug\s+(\d+)', self.subject, re.I)
-        self.bug = bugmatch and Bug(bugmatch.group(1))
-
-        # Parse the reviewer list
-        reviewer_re = r'r((?:[?=,][^,\s]+)+)'
-        self.reviewers = []
-        for rmatch in re.finditer(reviewer_re, self.subject, re.I):
-            for name in re.split(r'[?=,]', rmatch.group(1))[1:]:
-                self.reviewers.append(Reviewer(name))
 
         # Parse the revision out of body, and strip to store in summary.
         self.revision = None
@@ -652,28 +638,43 @@ class Commit(Cached):
             rev_replace, self.body, count=1, flags=re.I | re.M
         ).strip()
 
-        self.title = re.sub(reviewer_re, '', self.subject, flags=re.I).strip()
-
-        # Check if this commit has a corresponding mercurial hash already.
-        # NOTE: We fall-back to using our git hash if we don't have a hg one.
-        # this is OK as it matches arc-cinnabar's behaviour.
-        try:
-            self.hg_hash = run('git-cinnabar', 'git2hg', self.commit_hash)
-            if self.hg_hash == NULL_SHA1:
-                self.hg_hash = self.commit_hash
-        except FileNotFoundError:
-            # Handle git-cinnabar being uninstalled
-            self.hg_hash = self.commit_hash
-
+    @onceprop
     def parent(self):
         if len(self.parent_hashes) == 1:
             return Commit(self.parent_hashes[0])
         return None
 
+    @onceprop
     def diff(self):
-        if not self._diff:
-            self._diff = Diff(self)
-        return self._diff
+        return Diff(self)
+
+    @onceprop
+    def hg_hash(self):
+        try:
+            hg_hash = run('git-cinnabar', 'git2hg', self.commit_hash)
+            if hg_hash != NULL_SHA1:
+                return hg_hash
+        except FileNotFoundError:
+            pass
+
+        # NOTE: We fall-back to using our git hash if we don't have a hg one.
+        # this is OK as it matches arc-cinnabar's behaviour.
+        return self.commit_hash
+
+    @onceprop
+    def title(self):
+        return self.reviewer_re.sub('', self.subject).strip()
+
+    @onceprop
+    def reviewers(self):
+        return [Reviewer(name)
+                for rmatch in self.reviewer_re.finditer(self.subject, re.I)
+                for name in re.split(r'[?=,]', rmatch.group(1))[1:]]
+
+    @onceprop
+    def bug(self):
+        bugmatch = re.search(r'bug\s+(\d+)', self.subject, re.I)
+        return bugmatch and Bug(bugmatch.group(1))
 
     def add_transaction(self, type, value):
         self.transactions.append({
@@ -683,7 +684,7 @@ class Commit(Cached):
 
     def recommit(self, parent, message):
         message = message.strip()  # Make sure to clean up trailing whitespace
-        if parent == self.parent() and message == self.raw_body.strip():
+        if parent == self.parent and message == self.raw_body.strip():
             return self
 
         # Set up the commit environment
@@ -724,7 +725,7 @@ def get_revisions(args):
         start, end = Commit(start), Commit(end)
     else:
         end = Commit(args.revspec)
-        start = end.parent()
+        start = end.parent
 
     current = Commit(ref)
     reparent = []
@@ -732,7 +733,7 @@ def get_revisions(args):
         if current is None:
             raise UserError(f'{end.abbrev} not direct ancestor of {ref}')
         reparent.append(current)
-        current = current.parent()
+        current = current.parent
     reparent.reverse()
 
     push = []
@@ -740,7 +741,7 @@ def get_revisions(args):
         if current is None:
             raise UserError(f'{start.abbrev} not direct ancestor of {end.abbrev}')
         push.append(current)
-        current = current.parent()
+        current = current.parent
     push.reverse()
 
     if len(push) == 0:
@@ -798,14 +799,13 @@ def process_args(args):
         label(f"Bug {commit.bug.bugno}", commit.bug.title)
 
         # Log computed information about the patch to be pushed
-        diff = commit.diff()
         summary = ''
-        longest = max(len(name) for name in diff.changes)
-        for path, change in diff.changes.items():
+        longest = max(len(name) for name in commit.diff.changes)
+        for path, change in commit.diff.changes.items():
             summary += f"{change.kind.short()} {path:<{longest}} "
             summary += style.bold(f"+{change.added}, -{change.deleted}\n")
-        summary += style.bold(f"{len(diff.changes)} files")
-        summary += style.bold(f" (+{diff.added}, -{diff.deleted})")
+        summary += style.bold(f"{len(commit.diff.changes)} files")
+        summary += style.bold(f" (+{commit.diff.added}, -{commit.diff.deleted})")
         label('Changes', summary)
 
         # Title Updates
@@ -825,7 +825,7 @@ def process_args(args):
             # Check for attempts to change the dependency graph
             if idx == 0:
                 raise UserError(f"parent D{olddepends.revid} not in push")
-            elif commit.parent().revision != olddepends:
+            elif commit.parent.revision != olddepends:
                 raise UserError(f"phlay can't change parent D{olddepends.revid}")
         elif idx > 0 and oldsummary == commit.summary:
             # Force a summary change if a dependency add is needed
@@ -849,9 +849,9 @@ def process_args(args):
 
     # Perform all uploads, and then publish all patches.
     for commit in push:
-        commit.diff().do_uploads(style)
+        commit.diff.do_uploads(style)
     for commit in push:
-        phid = commit.diff().do_publish(style)
+        phid = commit.diff.do_publish(style)
         commit.add_transaction('update', phid)
 
     # Perform the commit rewriting
@@ -899,10 +899,9 @@ def process_args(args):
 
 
 def update_check(style):
-    conn = HTTPSConnection('raw.githubusercontent.com')
-    conn.request('GET', '/mystor/phlay/master/phlay')
-    match = re.search(rb"__version__\s*=\s*'([^']+)'",
-                      conn.getresponse().read(), re.I)
+    data = http('raw.githubusercontent.com',
+                '/mystor/phlay/master/phlay', binary=True)
+    match = re.search(rb"__version__\s*=\s*'([^']+)'", data, re.I)
     new_version = match.group(1).decode() if match else '0.1.0'
     if new_version > __version__:
         changes = f"RELEASES.md#version-{new_version.replace('.', '')}"
