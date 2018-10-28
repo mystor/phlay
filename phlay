@@ -597,22 +597,19 @@ class Commit(Cached):
 
         self.title = re.sub(reviewer_re, '', self.subject, flags=re.I).strip()
 
-        # Check if this commit has a corresponding mercurial hash already
-        # computed and cached. If we don't, and we need it, we will compute it
-        # later in ensure_hg_hashes.
+        # Check if this commit has a corresponding mercurial hash already.
+        # NOTE: We fall-back to using our git hash if we don't have a hg one.
+        # this is OK as it matches arc-cinnabar's behaviour.
         try:
             self.hg_hash = check_output([
                 'git-cinnabar', 'git2hg', self.commit_hash
             ]).decode().strip()
 
-            # If we don't have a valid cinnabar hash, fall-back. If
-            # '--hg-bundle' is passed, this will be corrected before pushing.
             if self.hg_hash == NULL_SHA1:
                 self.hg_hash = self.commit_hash
         except FileNotFoundError:
             # Handle git-cinnabar being uninstalled
             self.hg_hash = self.commit_hash
-
 
     def parent(self):
         if len(self.parent_hashes) == 1:
@@ -653,75 +650,6 @@ class Commit(Cached):
 
     def __repr__(self):
         return f'<commit {self.abbrev} {repr(self.subject)}>'
-
-
-def ensure_hg_hashes(commits):
-    """Ensures that the range of commits 'commits' all has valid mercurial
-    hashes. |commits| must be sorted, with the oldest commit at index |0|."""
-
-    # Determine the set of commits which we will make into mercurial commits.
-    # Cinnabar will complain if our base commit's parent doesn't have a
-    # precomputed mercurial hash, so we have to climb until we find a commit
-    # which does.
-    to_hg = []
-    current = commits[0].parent()
-    while not (current and current.hg_hash != current.commit_hash):
-        if current is None:
-            raise UserError(f'no direct mercurial ancestor!')
-        to_hg.append(current)
-        current = current.parent()
-    to_hg.reverse()
-    to_hg += commits
-
-    # Map from mercurial parent commits to child commits.
-    hg_ptoc = {}
-
-    # Get cinnabar to export a bundle with the specified commits. This will
-    # determine the mercurial hashes for those commits. We then parse the v1
-    # bundle format to extract relevant sha1 values.
-    with TemporaryDirectory() as tmpdir:
-        path = os.path.join(tmpdir, 'bundle.hg')
-
-        # XXX(nika): This is probably the slowest part of phlay. Perhaps we could
-        # run it in parallel with the other network/io code (e.g. using asyncio)?
-        # We don't need the information until after you approve selected commits.
-        check_call(['git', 'cinnabar', 'bundle',
-                    '--version', '1', path,
-                    f"{current.commit_hash}..{to_hg[-1].commit_hash}"])
-
-        # The header of each chunk is 84 bytes long (4 bytes of length, 4x20
-        # bytes of sha1 hashes).
-        CHUNK_HEADER = 84
-
-        with open(path, 'rb') as f:
-            # Check the bundle type is an uncompressed v1 bundle.
-            assert f.read(6) == b'HG10UN', "bad bundle type"
-
-            while True:
-                # Read the size of the current section. A size too small to fit
-                # a header means we're done.
-                length = int.from_bytes(f.read(4), byteorder='big')
-                if length <= CHUNK_HEADER:
-                    break
-
-                # Read the header, containing 4x sha1 hashes, and skip the
-                # remaining data.
-                node = f.read(20).hex()
-                parent1 = f.read(20).hex()
-                parent2 = f.read(20).hex()
-                changeset = f.read(20).hex()
-                f.read(length - CHUNK_HEADER)
-
-                assert parent2 == NULL_SHA1, "Should have 1 parent"
-                assert changeset == node, "Changeset should match node"
-
-                # Stash the parent-to-child mapping
-                hg_ptoc[parent1] = node
-
-    # Apply the computed hg_ptoc map to add mercurial hashes
-    for commit in to_hg:
-        assert commit.parent().hg_hash != commit.parent().commit_hash
-        commit.hg_hash = hg_ptoc[commit.parent().hg_hash]
 
 
 def get_revisions(args):
@@ -784,11 +712,6 @@ def process_args(args):
 
     # Stash the current sha1 for |ref|
     initial_ref = Commit(ref)
-
-    # Ensure we have a mercurial hash for each commit we want to push.
-    if args.hg_bundle:
-        print(style.bold_yellow("Calculating Hg Changesets"))
-        ensure_hg_hashes(push)
 
     # Define a helper for printing styled & labeled information to stdout.
     def label(label, *rest):
@@ -944,9 +867,9 @@ def process_args(args):
 def update_check(style):
     conn = HTTPSConnection('raw.githubusercontent.com')
     conn.request('GET', '/mystor/phlay/master/phlay')
-    resp = conn.getresponse().read().decode()
-    match = re.search(r"__version__\s*=\s*'([^']+)'", resp, re.I)
-    new_version = match.group(1) if match else '0.1.0'
+    match = re.search(rb"__version__\s*=\s*'([^']+)'",
+                      conn.getresponse().read(), re.I)
+    new_version = match.group(1).decode() if match else '0.1.0'
     if new_version > __version__:
         changes = f"RELEASES.md#version-{new_version.replace('.', '')}"
         print(textwrap.dedent(f"""
@@ -969,8 +892,6 @@ def main():
     parser.add_argument('--color', default='auto', type=Style,
                         choices=['always', 'never', 'auto'],
                         help='control output colorization')
-    parser.add_argument('--hg-bundle', action='store_true',
-                        help='compute accurate mercurial hashes w/ cinnabar')
     parser.add_argument('revspec', nargs='?', default='HEAD',
                         help='commit range to push for review')
     args = parser.parse_args()
