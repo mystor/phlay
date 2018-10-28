@@ -59,16 +59,17 @@ class UserError(Exception):
 
 
 class Conduit:
-    def __init__(self, arcrc_path):
+    @classmethod
+    def init(cls, arcrc_path):
         # Load the global and local Arcanist configuration
-        self.top = Path(check_output(['git', 'rev-parse', '--show-toplevel'])
-                        .decode().strip())
-        with open(self.top / '.arcconfig') as f:
+        cls.top = Path(check_output(['git', 'rev-parse', '--show-toplevel'])
+                       .decode().strip())
+        with open(cls.top / '.arcconfig') as f:
             arcconfig = json.load(f)
 
         # Load the URL from the local arcconfig
-        self.url = urlparse(arcconfig['phabricator.uri'])
-        if self.url.scheme != 'https':
+        cls.url = urlparse(arcconfig['phabricator.uri'])
+        if cls.url.scheme != 'https':
             raise UserError('Only HTTPS scheme phabricator.uri are supported')
 
         # Find our authentication token
@@ -78,37 +79,38 @@ class Conduit:
             with open(arcrc_path) as f:
                 arcrc = json.load(f)
 
-            self.token = next(data['token'] for url, data in arcrc['hosts'].items()
-                              if urlparse(url).netloc == self.url.netloc)
+            cls.token = next(data['token'] for url, data in arcrc['hosts'].items()
+                             if urlparse(url).netloc == cls.url.netloc)
         except (IOError, StopIteration):
-            self.token = input(textwrap.dedent(f"""\
+            cls.token = input(textwrap.dedent(f"""\
                 LOGIN TO PHABRICATOR
 
                 Open this page in your browser, and login if necessary:
-                https://{self.url.netloc}/conduit/login
+                https://{cls.url.netloc}/conduit/login
 
                 API Token from that page: """)).strip()
 
             # Double-check the token works
-            self.do('user.whoami')
+            cls.do('user.whoami')
 
             # Update our arcrc
-            api_uri = f"https://{self.url.netloc}/api/"
+            api_uri = f"https://{cls.url.netloc}/api/"
             arcrc['hosts'] = arcrc.get('hosts', {})
             arcrc['hosts'][api_uri] = arcrc['hosts'].get(api_uri, {})
-            arcrc['hosts'][api_uri]['token'] = self.token
+            arcrc['hosts'][api_uri]['token'] = cls.token
             with open(arcrc_path, 'w') as f:
                 json.dump(arcrc, f, indent=2)
 
         # Connect to Conduit to determine our repository's PHID
-        self.repository = self.search_one('diffusion.repository', {
+        cls.repository = cls.search_one('diffusion.repository', {
             'callsigns': [arcconfig['repository.callsign']]
         })
-        self.hostname = socket.gethostname()
+        cls.hostname = socket.gethostname()
 
-    def do(self, cmd_name, **params):
+    @classmethod
+    def do(cls, cmd_name, **params):
         # Add the token & write out parameters.
-        params['__conduit__'] = { 'token': self.token }
+        params['__conduit__'] = {'token': cls.token}
         body = urlencode({
             'params': json.dumps(params),
             'output': 'json',
@@ -116,7 +118,7 @@ class Conduit:
         })
 
         # Send the POST request
-        conn = HTTPSConnection(self.url.netloc)
+        conn = HTTPSConnection(cls.url.netloc)
         conn.request("POST", f'/api/{cmd_name}', body=body)
 
         # Read the response as JSON
@@ -125,11 +127,12 @@ class Conduit:
             raise UserError(f"conduit[{resp['error_code']}]: {resp['error_info']}")
         return resp['result']
 
-    def search_one(self, what, constraints, attachments={}):
-        resp = self.do(f'{what}.search',
-                       constraints=constraints,
-                       attachments=attachments,
-                       limit=1)
+    @classmethod
+    def search_one(cls, what, constraints, attachments={}):
+        resp = cls.do(f'{what}.search',
+                      constraints=constraints,
+                      attachments=attachments,
+                      limit=1)
         if len(resp['data']) != 1:
             raise UserError(f'cannot find {what} (constraints={constraints})')
         return resp['data'][0]
@@ -396,38 +399,38 @@ class Diff:
 
         return change
 
-    def do_uploads(self, style, conduit):
+    def do_uploads(self, style):
         for change in self.changes.values():
             for upload in change.uploads:
                 print(style.bold_yellow('Uploading Binary'),
                       f"{change.cur_path} [{upload['type']}] {upload['mime']}")
                 data_base64 = base64.standard_b64encode(upload['value'])
-                upload['phid'] = conduit.do('file.upload',
+                upload['phid'] = Conduit.do('file.upload',
                                             data_base64=data_base64.decode())
                 print(f"    File PHID: {upload['phid']}")
 
-    def do_publish(self, style, conduit):
+    def do_publish(self, style):
         print(style.bold_yellow('Publishing Patch'), f"{self.commit.subject}")
         changes = [change.to_conduit(self.commit)
                    for change in self.changes.values()]
-        diff = conduit.do('differential.creatediff',
+        diff = Conduit.do('differential.creatediff',
                           changes=changes,
-                          sourceMachine=conduit.hostname,
+                          sourceMachine=Conduit.hostname,
                           sourceControlSystem='hg',
                           sourceControlPath='/',
                           sourceControlBaseRevision=self.commit.parent().hg_hash,
                           creationMethod='phlay',
                           lintStatus='none',
                           unitStatus='none',
-                          repositoryPHID=conduit.repository['phid'],
-                          sourcePath=str(conduit.top),
+                          repositoryPHID=Conduit.repository['phid'],
+                          sourcePath=str(Conduit.top),
                           # XXX(nika): This seems kinda irrelevant?
                           branch='HEAD')
         print(f"    Diff URI: {diff['uri']}")
 
         # Add information about our local commit to the patch. This info is
         # needed by lando.
-        conduit.do('differential.setdiffproperty',
+        Conduit.do('differential.setdiffproperty',
                    diff_id=diff['diffid'],
                    name='local:commits',
                    data=json.dumps({
@@ -468,49 +471,77 @@ class Cached:
 
 class Revision(Cached):
     _info = None
-    DEP_SPEC = re.compile(r'Depends\s+On\s*D([0-9]+)', re.I)
+    dep_re = re.compile(r'Depends\s+On\s*D([0-9]+)', re.I)
 
     def init(self, revid):
         self.revid = int(revid)
 
-    def info(self, conduit):
+    @property
+    def info(self):
         if self._info is None:
-            self._info = conduit.search_one('differential.revision', {
+            self._info = Conduit.search_one('differential.revision', {
                 'ids': [self.revid]
             }, attachments={'reviewers': True})
         return self._info
 
-    def summary(self, conduit):
-        return self.DEP_SPEC.sub(
-            '', self.info(conduit)['fields']['summary'], count=1
-        ).strip()
+    @property
+    def summary(self):
+        return self.dep_re.sub('', self.raw_summary, count=1).strip()
 
-    def depends_on(self, conduit):
-        dep = self.DEP_SPEC.match(self.info(conduit)['fields']['summary'])
+    @property
+    def depends_on(self):
+        dep = self.dep_re.match(self.raw_summary)
         return Revision(dep.group(1)) if dep else None
 
-    def url(self, conduit):
-        return f"https://{conduit.url.netloc}/D{self.revid}"
+    @property
+    def phid(self):
+        return self.info['phid']
+
+    @property
+    def repo_phid(self):
+        return self.info['fields']['repositoryPHID']
+
+    @property
+    def bug(self):
+        return Bug(self.info['fields']['bugzilla.bug-id'])
+
+    @property
+    def title(self):
+        return self.info['fields']['title']
+
+    @property
+    def reviewers(self):
+        infos = self.info['attachments']['reviewers']['reviewers']
+        return [reviewer['reviewerPHID'] for reviewer in infos]
+
+    @property
+    def raw_summary(self):
+        return self.info['fields']['summary']
+
+    @property
+    def url(self):
+        return f"https://{Conduit.url.netloc}/D{self.revid}"
 
 
 class Bug(Cached):
-    _info = None
+    _title = None
 
     def init(self, bugno):
         self.bugno = int(bugno)
 
-    def info(self, _conduit):
-        if self._info is None:
+    @property
+    def title(self):
+        if self._title is None:
             conn = HTTPSConnection('bugzilla.mozilla.org')
             conn.request('GET', f"/rest/bug/{self.bugno}")
             resp = json.load(conn.getresponse())
             if resp.get('error', False):
                 if resp['code'] != 102:  # Not an access error
                     raise UserError(resp['message'])
-                self._info = {'summary': '<private bug>'}
+                self._title = '<private bug>'
             else:
-                self._info = resp['bugs'][0]
-        return self._info
+                self._title = resp['bugs'][0]['summary']
+        return self._title
 
 
 class Reviewer(Cached):
@@ -519,23 +550,44 @@ class Reviewer(Cached):
     def init(self, tag):
         self.tag = tag
 
-    def info(self, conduit):
+    @property
+    def info(self):
         if self._info is None:
             try:
                 # First, we try to locate a user with the reviewer's name.
-                self._info = conduit.search_one('user', {
+                self._info = Conduit.search_one('user', {
                     'usernames': [self.tag]
                 })
             except UserError:
                 try:
                     # Then we locate a project based on its slug.
-                    self._info = conduit.search_one('project', {
+                    self._info = Conduit.search_one('project', {
                         'slugs': [self.tag]
                     })
                 except UserError:
                     raise UserError(f"no such reviewer: {self.tag}")
 
         return self._info
+
+    @property
+    def kind(self):
+        return self.info['type']
+
+    @property
+    def phid(self):
+        return self.info['phid']
+
+    @property
+    def name(self):
+        if self.kind == 'USER':
+            return self.info['fields']['realName']
+        return self.info['fields']['name']
+
+    @property
+    def handle(self):
+        if self.kind == 'USER':
+            return ':' + self.info['fields']['username']
+        return '#' + self.tag
 
 
 class Commit(Cached):
@@ -566,8 +618,8 @@ class Commit(Cached):
         self._diff = None
 
         # Read information from 'git show'
-        FIELDS = { k: v for k, v in Commit.__dict__.items()
-                   if type(v) == str and v.startswith('%') }
+        FIELDS = {k: v for k, v in Commit.__dict__.items()
+                  if type(v) == str and v.startswith('%')}
         FORMAT = '%x00'.join(FIELDS.values())
 
         info = check_output(['git', 'show', '-q', f'--format={FORMAT}', rev])
@@ -707,7 +759,7 @@ def process_args(args):
               file=sys.stderr)
 
     # Set up state for arguments
-    conduit = Conduit(args.arcrc)
+    Conduit.init(args.arcrc)
     start, ref, push, reparent = get_revisions(args)
 
     # Stash the current sha1 for |ref|
@@ -729,25 +781,22 @@ def process_args(args):
 
         # Determine which revision we're working with
         if commit.revision is None:
-            label('New Revision', conduit.repository['fields']['name'])
+            label('New Revision', Conduit.repository['fields']['name'])
 
-            commit.add_transaction('repositoryPHID', conduit.repository['phid'])
+            commit.add_transaction('repositoryPHID', Conduit.repository['phid'])
             commit.add_transaction('bugzilla.bug-id', str(commit.bug.bugno))
         else:
-            revinfo = commit.revision.info(conduit)
-            revfields = revinfo['fields']
-            label('Update Revision', commit.revision.url(conduit))
+            label('Update Revision', commit.revision.url)
 
-            if revfields['repositoryPHID'] != conduit.repository['phid']:
+            if commit.revision.repo_phid != Conduit.repository['phid']:
                 raise UserError('mismatched revision repository ' +
-                                revfields['repositoryPHID'])
-            if revfields['bugzilla.bug-id'] != str(commit.bug.bugno):
+                                commit.revision.repo_phid)
+            if commit.revision.bug != commit.bug:
                 raise UserError('mismatched bug # ' +
-                                revfields['bugzilla.bug-id'])
+                                str(commit.revision.bug.bugno))
 
         # Always write out basic bug info
-        buginfo = commit.bug.info(conduit)
-        label(f"Bug {commit.bug.bugno}", buginfo['summary'])
+        label(f"Bug {commit.bug.bugno}", commit.bug.title)
 
         # Log computed information about the patch to be pushed
         diff = commit.diff()
@@ -761,18 +810,18 @@ def process_args(args):
         label('Changes', summary)
 
         # Title Updates
-        if not commit.revision or revinfo['fields']['title'] != commit.title:
+        if not commit.revision or commit.revision.title != commit.title:
             commit.add_transaction('title', commit.title)
             label('Set Title', commit.title)
 
         # Summary Updates
-        oldsummary = commit.revision and commit.revision.summary(conduit)
+        oldsummary = commit.revision and commit.revision.summary
         if oldsummary != commit.summary:
             commit.add_transaction('summary', commit.summary)
             label('Set Summary', commit.summary)
 
         # Do some validation on dependencies
-        olddepends = commit.revision and commit.revision.depends_on(conduit)
+        olddepends = commit.revision and commit.revision.depends_on
         if olddepends:
             # Check for attempts to change the dependency graph
             if idx == 0:
@@ -785,23 +834,11 @@ def process_args(args):
 
         # Add any reviewers not in the original commit
         to_add = []
-        rev_phids = []
-        if commit.revision:
-            reviewers = revinfo['attachments']['reviewers']['reviewers']
-            rev_phids = [reviewer['reviewerPHID'] for reviewer in reviewers]
-
         for reviewer in commit.reviewers:
-            reviewerinfo = reviewer.info(conduit)
-            if reviewerinfo['phid'] not in rev_phids:
-                to_add.append(f"blocking({reviewerinfo['phid']})")
-                if reviewerinfo['type'] == 'USER':
-                    label('Add Reviewer',
-                          reviewerinfo['fields']['realName'],
-                          f"[:{reviewerinfo['fields']['username']}]")
-                elif reviewerinfo['type'] == 'PROJ':
-                    label('Add Reviewer',
-                          reviewerinfo['fields']['name'],
-                          f"[#{reviewer.tag}]")
+            if commit.revision and reviewer.phid in commit.revision.reviewers:
+                continue
+            to_add.append(f"blocking({reviewer.phid})")
+            label('Add Reviewer', reviewer.name, f"[{reviewer.handle}]")
         if len(to_add) > 0:
             commit.add_transaction('reviewers.add', to_add)
 
@@ -813,9 +850,9 @@ def process_args(args):
 
     # Perform all uploads, and then publish all patches.
     for commit in push:
-        commit.diff().do_uploads(style, conduit)
+        commit.diff().do_uploads(style)
     for commit in push:
-        phid = commit.diff().do_publish(style, conduit)
+        phid = commit.diff().do_publish(style)
         commit.add_transaction('update', phid)
 
     # Perform the commit rewriting
@@ -834,14 +871,14 @@ def process_args(args):
         # Send the revision edit request.
         params = {'transactions': commit.transactions}
         if commit.revision is not None:
-            params['objectIdentifier'] = commit.revision.info(conduit)['phid']
-        editrv = conduit.do('differential.revision.edit', **params)
+            params['objectIdentifier'] = commit.revision.phid
+        editrv = Conduit.do('differential.revision.edit', **params)
 
         # Get additional information about the newly created revision
         if commit.revision is None:
-            revurl = Revision(editrv['object']['id']).url(conduit)
+            revurl = Revision(editrv['object']['id']).url
         else:
-            revurl = commit.revision.url(conduit)
+            revurl = commit.revision.url
         print(f"    Revision URI: {revurl}")
 
         # Perform a rewrite of the commit, and move to the next
