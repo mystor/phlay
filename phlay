@@ -13,10 +13,10 @@ import difflib
 import mimetypes
 import textwrap
 import shlex
+import subprocess
 
 from http.client import HTTPSConnection
 from urllib.parse import urlencode, urlparse
-from subprocess import check_output, check_call, CalledProcessError
 from argparse import ArgumentParser
 from tempfile import TemporaryDirectory
 from collections import namedtuple
@@ -25,6 +25,13 @@ from enum import Enum
 
 
 NULL_SHA1 = '0' * 40
+
+
+def run(*args, binary=False, **kwargs):
+    out = subprocess.check_output(args, **kwargs)
+    if binary:
+        return out
+    return out.decode(errors='replace').rstrip()
 
 
 class Style:
@@ -62,8 +69,7 @@ class Conduit:
     @classmethod
     def init(cls, arcrc_path):
         # Load the global and local Arcanist configuration
-        cls.top = Path(check_output(['git', 'rev-parse', '--show-toplevel'])
-                       .decode().strip())
+        cls.top = Path(run('git', 'rev-parse', '--show-toplevel'))
         with open(cls.top / '.arcconfig') as f:
             arcconfig = json.load(f)
 
@@ -229,7 +235,6 @@ class Diff:
             elif self == self.MULTICOPY:
                 return 'C*'
 
-
     class FileType(Enum):
         TEXT = 1
         IMAGE = 2
@@ -244,8 +249,8 @@ class Diff:
         self.changes = {}
         self.phid = None
 
-        raw = check_output(['git', 'diff-tree', '-r', '--raw', '-z', '-M', '-C',
-                            '--no-abbrev', commit.commit_hash]).decode(errors='replace')
+        raw = run('git', 'diff-tree', '-r', '--raw', '-z', '-M', '-C',
+                  '--no-abbrev', commit.commit_hash)
         # Strip the prefix sha1, and remove the trailing null
         for c in raw[:-1].split('\0:')[1:]:
             self.parse_change(c)
@@ -280,9 +285,9 @@ class Diff:
         # Extract the bodies of blobs to compare
         a_body, b_body = b'', b''
         if a_blob != NULL_SHA1:
-            a_body = check_output(['git', 'cat-file', 'blob', a_blob])
+            a_body = run('git', 'cat-file', 'blob', a_blob, binary=True)
         if b_blob != NULL_SHA1:
-            b_body = check_output(['git', 'cat-file', 'blob', b_blob])
+            b_body = run('git', 'cat-file', 'blob', b_blob, binary=True)
 
         # Detect if we're binary, and generate a unified diff
         change.binary = b'\0' in a_body or b'\0' in b_body
@@ -611,7 +616,7 @@ class Commit(Cached):
     def key(cls, rev):
         if re.fullmatch(r'[a-f0-9]{40}', rev, re.I):
             return rev  # If it looks like a full sha1, just return it
-        return check_output(['git', 'rev-parse', '--verify', rev]).decode().strip()
+        return run('git', 'rev-parse', '--verify', rev)
 
     def init(self, rev):
         self.transactions = []
@@ -622,8 +627,8 @@ class Commit(Cached):
                   if type(v) == str and v.startswith('%')}
         FORMAT = '%x00'.join(FIELDS.values())
 
-        info = check_output(['git', 'show', '-q', f'--format={FORMAT}', rev])
-        self.__dict__.update(zip(FIELDS.keys(), info.decode(errors='replace').split('\0')))
+        info = run('git', 'show', '-q', f'--format={FORMAT}', rev)
+        self.__dict__.update(zip(FIELDS.keys(), info.split('\0')))
         self.parent_hashes = self.parent_hashes.split()
 
         # Compute more info based on the commit message etc.
@@ -653,10 +658,7 @@ class Commit(Cached):
         # NOTE: We fall-back to using our git hash if we don't have a hg one.
         # this is OK as it matches arc-cinnabar's behaviour.
         try:
-            self.hg_hash = check_output([
-                'git-cinnabar', 'git2hg', self.commit_hash
-            ]).decode().strip()
-
+            self.hg_hash = run('git-cinnabar', 'git2hg', self.commit_hash)
             if self.hg_hash == NULL_SHA1:
                 self.hg_hash = self.commit_hash
         except FileNotFoundError:
@@ -693,11 +695,9 @@ class Commit(Cached):
                    GIT_COMMITTER_EMAIL=self.committer_email,
                    GIT_COMMITTER_DATE=self.committer_date)
 
-        newsha = check_output([
-            'git', 'commit-tree',
-            '-p', parent.commit_hash,
-            self.tree_hash
-        ], input=message.encode(), env=env).decode().strip()
+        newsha = run('git', 'commit-tree',
+                     '-p', parent.commit_hash, self.tree_hash,
+                     input=message.encode(), env=env)
         return Commit(newsha)
 
     def __repr__(self):
@@ -709,8 +709,7 @@ def get_revisions(args):
     if args.ref != 'HEAD':
         # Limit to '--heads' if no path is provided
         heads = [] if '/' in args.ref else ['--heads']
-        lines = check_output(['git', 'show-ref', *heads, args.ref]) \
-            .decode().strip().splitlines()
+        lines = run('git', 'show-ref', *heads, args.ref).splitlines()
         if len(lines) != 1:
             raise UserError(f'Ambiguous or Unknown ref: {args.ref}')
         ref = lines[0].split()[1]
@@ -895,10 +894,8 @@ def process_args(args):
     if initial_ref != parent:
         print(style.bold_yellow(f"Updating Ref"), ref)
         print(f"    {initial_ref.abbrev} => {parent.abbrev}")
-        check_call([
-            'git', 'update-ref', '-m', 'phlay: rewrite',
-            ref, parent.commit_hash, initial_ref.commit_hash,
-        ])
+        run('git', 'update-ref', '-m', 'phlay: rewrite',
+            ref, parent.commit_hash, initial_ref.commit_hash)
 
 
 def update_check(style):
@@ -938,7 +935,7 @@ def main():
     except KeyboardInterrupt:
         print(args.color.bold_red('error'), 'interrupted', file=sys.stderr)
         sys.exit(1)
-    except CalledProcessError as e:
+    except subprocess.CalledProcessError as e:
         pretty = ' '.join(shlex.quote(c) for c in e.cmd)
         print(args.color.bold_red('error'), f"command failed: {pretty}",
               file=sys.stderr)
