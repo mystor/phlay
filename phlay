@@ -37,7 +37,7 @@ class Style:
             return self + str(s) + curses.tparm(curses.tigetstr('sgr0')).decode()
 
     def __init__(self, color, stream=sys.stdout):
-        dumb = os.environ["TERM"] == "dumb"
+        dumb = os.environ.get("TERM") == "dumb"
         self.styled = color == 'always' or (color == 'auto' and stream.isatty() and not dumb)
         if self.styled:
             curses.setupterm()
