@@ -883,7 +883,7 @@ def process_args(args):
         # Perform a rewrite of the commit, and move to the next
         commitmsg = commit.raw_body.strip()
         if commit.revision is None:
-            commitmsg += f"\n\nDifferential Revision: {revurl}"
+            commitmsg += f"\n\nDifferential Revision: {revurl}\n"
         parent = commit.recommit(parent, commitmsg)
 
     # Reparent remaining commits
