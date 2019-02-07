@@ -63,14 +63,17 @@ class Conduit:
         # Load the global and local Arcanist configuration
         git_top = (check_output(['git', 'rev-parse', '--show-toplevel'])
                    .decode().strip())
-        if (len(git_top) > 2 and git_top[0].isalpha() and git_top[1] == ":" and
-                os.path.exists("/bin/wslpath")):
-            # Git returned a Windows path, but phlay is running in WSL.
-            # Therefore, we must translate the path to a WSL path.
-            self.top = Path(check_output(['/bin/wslpath', git_top]).decode()
-                            .strip())
-        else:
+        if git_top.startswith('/'):
             self.top = Path(git_top)
+        else:
+            # This is probably a Windows path.
+            # If we're in WSL, this needs to be converted.
+            try:
+                self.top = Path(check_output(['/bin/wslpath', git_top]).decode()
+                                .strip())
+            except FileNotFoundError:
+                # Probably not in WSL.
+                self.top = Path(git_top)
         with open(self.top / '.arcconfig') as f:
             arcconfig = json.load(f)
 
