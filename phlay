@@ -61,8 +61,19 @@ class UserError(Exception):
 class Conduit:
     def __init__(self, arcrc_path):
         # Load the global and local Arcanist configuration
-        self.top = Path(check_output(['git', 'rev-parse', '--show-toplevel'])
-                        .decode().strip())
+        git_top = (check_output(['git', 'rev-parse', '--show-toplevel'])
+                   .decode().strip())
+        if git_top.startswith('/'):
+            self.top = Path(git_top)
+        else:
+            # This is probably a Windows path.
+            # If we're in WSL, this needs to be converted.
+            try:
+                self.top = Path(check_output(['/bin/wslpath', git_top]).decode()
+                                .strip())
+            except FileNotFoundError:
+                # Probably not in WSL.
+                self.top = Path(git_top)
         with open(self.top / '.arcconfig') as f:
             arcconfig = json.load(f)
 
