@@ -1,3 +1,7 @@
+# Version 0.1.5
+
+* Support for Windows paths from WSL
+
 # Version 0.1.4
 * Support pushing patches for private/secure bugs better
 
