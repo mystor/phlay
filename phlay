@@ -824,7 +824,12 @@ def process_args(args):
         else:
             revinfo = commit.revision.info(conduit)
             revfields = revinfo['fields']
-            label('Update Revision', commit.revision.url(conduit))
+
+            action = 'Update Revision'
+            if args.reopen and revfields['status']['closed']:
+                commit.add_transaction('reopen', True)
+                action = 'Reopen Revision'
+            label(action, commit.revision.url(conduit))
 
             if revfields['repositoryPHID'] != conduit.repository['phid']:
                 raise UserError('mismatched revision repository ' +
@@ -982,6 +987,8 @@ def main():
                         help='control output colorization')
     parser.add_argument('--hg-bundle', action='store_true',
                         help='compute accurate mercurial hashes w/ cinnabar')
+    parser.add_argument('--reopen', action='store_true',
+                        help='re-open closed revisions')
     parser.add_argument('revspec', nargs='?', default='HEAD',
                         help='commit range to push for review')
     args = parser.parse_args()
