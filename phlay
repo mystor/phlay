@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-__version__ = '0.1.7'
+__version__ = '0.1.8'
 
 import sys
 import os
@@ -25,6 +25,7 @@ from enum import Enum
 
 
 NULL_SHA1 = '0' * 40
+EMPTY_BLOB = 'e69de29bb2d1d6434b8b29ae775ad8c2e48c5391'
 
 
 class Style:
@@ -286,10 +287,14 @@ class Diff:
         change = self.change_for(b_path)
 
         # Extract the bodies of blobs to compare
-        a_body, b_body = b'', b''
-        if a_blob != NULL_SHA1:
+        if a_blob == NULL_SHA1:
+            a_blob, a_body = EMPTY_BLOB, b''
+        else:
             a_body = check_output(['git', 'cat-file', 'blob', a_blob])
-        if b_blob != NULL_SHA1:
+
+        if b_blob == NULL_SHA1:
+            b_blob, b_body = EMPTY_BLOB, b''
+        else:
             b_body = check_output(['git', 'cat-file', 'blob', b_blob])
 
         # Detect if we're binary, and generate a unified diff

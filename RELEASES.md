@@ -1,6 +1,10 @@
+# Version 0.1.8
+
+* Handle parsing empty files correctly in change parser.
+
 # Version 0.1.7
 
-* Correctly set the mode but on newly created files.
+* Correctly set the mode bit on newly created files.
 
 # Version 0.1.6
 
