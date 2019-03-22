@@ -359,7 +359,7 @@ class Diff:
         # Determine the correct kind from the letter
         if kind_l[0] == 'A':
             change.kind = self.Kind.ADD
-            change.new_mode = b_mode
+            change.cur_mode = b_mode
 
         elif kind_l[0] == 'D':
             change.kind = self.Kind.DELETE
@@ -370,7 +370,7 @@ class Diff:
             change.kind = self.Kind.CHANGE
             if a_mode != b_mode:
                 change.old_mode = a_mode
-                change.new_mode = b_mode
+                change.cur_mode = b_mode
             change.old_path = a_path
             assert change.old_path == change.cur_path
 
@@ -378,7 +378,7 @@ class Diff:
             change.kind = self.Kind.MOVE_HERE
             if a_mode != b_mode:
                 change.old_mode = a_mode
-                change.new_mode = b_mode
+                change.cur_mode = b_mode
 
             change.old_path = a_path
             old = self.change_for(change.old_path)
@@ -392,7 +392,7 @@ class Diff:
             change.kind = self.Kind.COPY_HERE
             if a_mode != b_mode:
                 change.old_mode = a_mode
-                change.new_mode = b_mode
+                change.cur_mode = b_mode
 
             change.old_path = a_path
             old = self.change_for(change.old_path)
