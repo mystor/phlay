@@ -1,3 +1,7 @@
+# Version 0.1.7
+
+* Correctly set the mode but on newly created files.
+
 # Version 0.1.6
 
 * Added --reopen flag to re-open changesets which were closed and are being updated.
