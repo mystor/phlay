@@ -314,7 +314,7 @@ class Diff:
                 lines = [f" {l}" for l in lines]
                 old_off = new_off = 1
                 old_len = new_len = len(lines)
-            else:
+            elif a_body or b_body:
                 # Use difflib to generate the base diff hunk, and match on the
                 # hunk line to extract offset and length info.
                 [hdr, *lines] = list(difflib.unified_diff(
@@ -328,6 +328,9 @@ class Diff:
                 old_len = int(m.group(2) or 1)
                 new_off = int(m.group(3))
                 new_len = int(m.group(4) or 1)
+            else:
+                lines = []
+                old_off = old_len = new_off = new_len = 0
 
             # Collect some stats about the diff, and generate the corpus we
             # want to send to Phabricator. Python's `difflib` doesn't handle
