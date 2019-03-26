@@ -1,6 +1,7 @@
 # Version 0.1.8
 
 * Handle parsing empty files correctly in change parser.
+* Uses new Conduit APIs to support mutating revision edges.
 
 # Version 0.1.7
 
