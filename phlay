@@ -843,7 +843,7 @@ def process_args(args):
 
         # Update dependency relationships if needed.
         pphids = [] if idx == 0 else [parent.revision.info(conduit)['phid']]
-        if commit.revision is None or pphids != commit.revision.parents(conduit):
+        if commit.revision is None or pphids != commit.revision.edges(conduit):
             commit.add_transaction('parents.set', pphids)
 
         # Send the revision edit request.
