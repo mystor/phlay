@@ -1,3 +1,7 @@
+# Version 0.1.9
+
+* Fix a typo causing failures updating revisions.
+
 # Version 0.1.8
 
 * Handle parsing empty files correctly in change parser.
