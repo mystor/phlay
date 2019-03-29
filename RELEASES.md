@@ -1,3 +1,7 @@
+# Version 0.1.10
+
+* Fix another typo (thanks @djg)
+
 # Version 0.1.9
 
 * Fix a typo causing failures updating revisions.
