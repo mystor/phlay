@@ -18,7 +18,7 @@ from http.client import HTTPSConnection, HTTPException
 from urllib.parse import urlencode, urlparse
 from subprocess import check_output, check_call, CalledProcessError
 from argparse import ArgumentParser
-from tempfile import TemporaryYes, it fixed the issue for me. Thanks!Directory
+from tempfile import TemporaryDirectory
 from collections import namedtuple
 from pathlib import Path
 from enum import Enum
