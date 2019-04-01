@@ -735,6 +735,14 @@ def process_args(args):
     # Stash the current sha1 for |ref|
     initial_ref = Commit(ref)
 
+    reopen_config = False
+    try:
+        reopen_config_output = check_output(
+            ['git', 'config', '--type=bool', 'phlay.reopen']).decode().strip()
+        reopen_config = (reopen_config_output == "true")
+    except CalledProcessError:
+        pass
+
     # Define a helper for printing styled & labeled information to stdout.
     def label(label, *rest):
         print('  ' + style.bold_cyan(label))
@@ -760,7 +768,7 @@ def process_args(args):
             revfields = revinfo['fields']
 
             action = 'Update Revision'
-            if args.reopen and revfields['status']['closed']:
+            if (args.reopen or reopen_config) and revfields['status']['closed']:
                 commit.add_transaction('reopen', True)
                 action = 'Reopen Revision'
             label(action, commit.revision.url(conduit))
