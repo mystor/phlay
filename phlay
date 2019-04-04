@@ -738,7 +738,7 @@ def process_args(args):
     reopen_config = False
     try:
         reopen_config_output = check_output(
-            ['git', 'config', '--type=bool', 'phlay.reopen']).decode().strip()
+            ['git', 'config', '--bool', 'phlay.reopen']).decode().strip()
         reopen_config = (reopen_config_output == "true")
     except CalledProcessError:
         pass
