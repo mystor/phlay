@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 __version__ = '0.1.10'
+# ^ The version is used for update checks and must contain at most three parts.
 
 import sys
 import os
@@ -14,6 +15,7 @@ import mimetypes
 import textwrap
 import shlex
 
+from distutils.version import StrictVersion
 from http.client import HTTPSConnection, HTTPException
 from urllib.parse import urlencode, urlparse
 from subprocess import check_output, check_call, CalledProcessError
@@ -891,9 +893,9 @@ def update_check(style):
     conn = HTTPSConnection('raw.githubusercontent.com')
     conn.request('GET', '/mystor/phlay/master/phlay')
     resp = conn.getresponse().read().decode()
-    match = re.search(r"__version__\s*=\s*'([^']+)'", resp, re.I)
+    match = re.search(r"__version__\s*=\s*'([0-9.]+)'", resp, re.I)
     new_version = match.group(1) if match else '0.1.0'
-    if new_version > __version__:
+    if StrictVersion(new_version) > StrictVersion(__version__):
         changes = f"RELEASES.md#version-{new_version.replace('.', '')}"
         print(textwrap.dedent(f"""
             {style.bold_yellow("NOTE: New Version Available")}
