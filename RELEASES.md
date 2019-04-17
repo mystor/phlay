@@ -1,3 +1,7 @@
+# Version 0.2.0
+
+* Fix version comparison bug which was preventing updates to 0.1.10 (https://github.com/mystor/phlay/pull/59)
+
 # Version 0.1.10
 
 * Fix another typo (thanks @djg)
