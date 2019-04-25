@@ -852,7 +852,9 @@ def process_args(args):
         print(style.bold_yellow(f"Requesting Review"), f"{commit.subject}")
 
         # Update dependency relationships if needed.
-        pphids = [] if idx == 0 else [parent.revision.info(conduit)['phid']]
+        pphids = []
+        if parent.bug == commit.bug and parent.revision:
+            pphids.append(parent.revision.info(conduit)['phid'])
         if commit.revision is None or pphids != commit.revision.edges(conduit):
             commit.add_transaction('parents.set', pphids)
 
