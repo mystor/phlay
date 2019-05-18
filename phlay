@@ -789,7 +789,7 @@ def process_args(args):
             # without having to push the whole patch stack again.
             local_parent_id = start.revision.info(conduit)['phid']
             remote_parent_ids = commit.revision.parents(conduit)
-            if local_parent_id in remote_parent_ids:
+            if local_parent_id in remote_parent_ids and not args.no_parent:
                 print(style.green(f"  Depending on D{start.revision.revid}"))
                 pphids = remote_parent_ids
             elif remote_parent_ids:
@@ -938,6 +938,8 @@ def main():
     parser.add_argument('--color', default='auto', type=Style,
                         choices=['always', 'never', 'auto'],
                         help='control output colorization')
+    parser.add_argument('--no-parent', action='store_true',
+                        help='remove existing dependency on parent revision')
     parser.add_argument('--reopen', action='store_true',
                         help='re-open closed revisions')
     parser.add_argument('revspec', nargs='?', default='HEAD',
