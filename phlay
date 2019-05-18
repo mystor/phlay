@@ -503,13 +503,13 @@ class Revision(Cached):
             '', self.info(conduit)['fields']['summary'], count=1
         ).strip()
 
-    def edges(self, conduit):
+    def parents(self, conduit):
         info = self.info(conduit)
-        self._edges = conduit.do('edge.search',
+        parent_objs = conduit.do('edge.search',
                                  sourcePHIDs=[info['phid']],
                                  types=['revision.parent'],
                                  limit=900)['data']
-        return [edge['destinationPHID'] for edge in self._edges]
+        return [edge['destinationPHID'] for edge in parent_objs]
 
     def url(self, conduit):
         return f"https://{conduit.url.netloc}/D{self.revid}"
@@ -853,7 +853,7 @@ def process_args(args):
 
         # Update dependency relationships if needed.
         pphids = [] if idx == 0 else [parent.revision.info(conduit)['phid']]
-        if commit.revision is None or pphids != commit.revision.edges(conduit):
+        if not commit.revision or pphids != commit.revision.parents(conduit):
             commit.add_transaction('parents.set', pphids)
 
         # Send the revision edit request.
