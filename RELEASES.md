@@ -1,3 +1,9 @@
+# Version 0.2.1
+
+* Phlay should now work in the MozillaBuild shell (https://github.com/mystor/phlay/pull/57)
+* Revision subranges can now be updated without breaking dependency relationships (https://github.com/mystor/phlay/pull/62)
+* Phlay will no longer drop newlines when rewriting commit messages
+
 # Version 0.2.0
 
 * Fix version comparison bug which was preventing updates to 0.1.10 (https://github.com/mystor/phlay/pull/59)
