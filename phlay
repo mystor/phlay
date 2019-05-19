@@ -658,8 +658,7 @@ class Commit(Cached):
         })
 
     def recommit(self, parent, message):
-        message = message.strip()  # Make sure to clean up trailing whitespace
-        if parent == self.parent() and message == self.raw_body.strip():
+        if parent == self.parent() and message == self.raw_body:
             return self
 
         # Set up the commit environment
@@ -916,9 +915,9 @@ def process_args(args):
         print(f"    Revision URI: {revurl}")
 
         # Perform a rewrite of the commit, and move to the next
-        commitmsg = commit.raw_body.strip()
+        commitmsg = commit.raw_body
         if commit.revision is None:
-            commitmsg += f"\n\nDifferential Revision: {revurl}"
+            commitmsg += f"\nDifferential Revision: {revurl}\n"
         parent = commit.recommit(parent, commitmsg)
 
     # Reparent remaining commits
