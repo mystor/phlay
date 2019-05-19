@@ -471,7 +471,7 @@ class Diff:
             conduit.do('differential.setdiffproperty',
                        diff_id=diff['diffid'],
                        name='phlay:version',
-                       data=__version__)
+                       data=json.dumps(__version__))
         except:
             # It's OK if this fails.
             print(style.yellow("note"), "phlay version annotation failed")
