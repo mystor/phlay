@@ -585,6 +585,7 @@ class Commit(Cached):
 
     def init(self, rev):
         self.transactions = []
+        self.warnings = []
         self._diff = None
 
         # Read information from 'git show'
@@ -750,7 +751,13 @@ def process_args(args):
         print('  ' + style.bold_cyan(label))
         print('    ' + ' '.join(str(s) for s in rest).replace('\n', '\n    '))
 
-    pphids = []
+    def warn(commit, *rest):
+        message = ' '.join(str(s) for s in rest)
+        commit.warnings.append(message)
+        print('  ' + style.bold_red("warning"))
+        print('    ' + message.replace('\n', '\n    '))
+
+    parent_phids = []
 
     # Validate that everything exists, and show computed info
     for idx, commit in enumerate(push):
@@ -784,17 +791,20 @@ def process_args(args):
                 raise UserError('mismatched bug # ' +
                                 revfields['bugzilla.bug-id'])
 
-        if idx == 0 and start.revision and commit.revision:
-            # Preserve existing parent, to allow users to push a single commit
-            # without having to push the whole patch stack again.
-            local_parent_id = start.revision.info(conduit)['phid']
-            remote_parent_ids = commit.revision.parents(conduit)
-            if local_parent_id in remote_parent_ids and not args.no_parent:
-                print(style.green(f"  Depending on D{start.revision.revid}"))
-                pphids = remote_parent_ids
-            elif remote_parent_ids:
-                print(style.red(f"  and clear its parent dependencies"))
-                pphids = None
+        # If the initial commit has parents which match local repository state,
+        # preserve them, allowing users to push a single commit without pushing
+        # the entire stack again.
+        if idx == 0 and commit.revision:
+            parent_phids = commit.revision.parents(conduit)
+
+            parent_matches = False
+            if commit.parent.revision and not args.no_parent:
+                phid = commit.parent.revision.info(conduit)['phid']
+                parent_matches = [phid] == parent_phids
+
+            if parent_phids and not parent_matches:
+                warn(commit, f"clearing {len(parent_phids)} parent revisions")
+                parent_phids = []
 
         # Always write out basic bug info
         try:
@@ -847,11 +857,18 @@ def process_args(args):
         if len(to_add) > 0:
             commit.add_transaction('reviewers.add', to_add)
 
-    if pphids is None:
-        pphids = []
-        # Show warning again in case the user did not see the previous message.
-        print()
-        print(style.red(f"Will clear parents of D{push[0].revision.revid}"))
+    # Re-display any warnings in case they were lost in the spew.
+    show_warning_header = True
+    for commit in push:
+        if not commit.warnings:
+            continue
+        if show_warning_header:
+            print()
+            print(style.bold_red("Warnings"))
+            show_warning_header = False
+        print(f"{style.yellow(commit.abbrev)} {commit.subject}")
+        for warning in commit.warnings:
+            print('  ' + warning.replace('\n', '\n  '))
 
     # Request user confirmation of printed information.
     if not args.assume_yes:
@@ -871,11 +888,14 @@ def process_args(args):
     for idx, commit in enumerate(push):
         print(style.bold_yellow(f"Requesting Review"), f"{commit.subject}")
 
-        # Update dependency relationships if needed.
+        # The first commit's parents were computed previously, so skip getting
+        # its parent's PHID.
         if idx != 0:
-            pphids = [parent.revision.info(conduit)['phid']]
-        if not commit.revision or pphids != commit.revision.parents(conduit):
-            commit.add_transaction('parents.set', pphids)
+            parent_phids = [parent.revision.info(conduit)['phid']]
+
+        # Update dependency relationships if needed.
+        if not commit.revision or parent_phids != commit.revision.parents(conduit):
+            commit.add_transaction('parents.set', parent_phids)
 
         # Send the revision edit request.
         params = {'transactions': commit.transactions}
