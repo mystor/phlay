@@ -798,8 +798,8 @@ def process_args(args):
             parent_phids = commit.revision.parents(conduit)
 
             parent_matches = False
-            if commit.parent.revision and not args.no_parent:
-                phid = commit.parent.revision.info(conduit)['phid']
+            if commit.parent().revision and not args.no_parent:
+                phid = commit.parent().revision.info(conduit)['phid']
                 parent_matches = [phid] == parent_phids
 
             if parent_phids and not parent_matches:
