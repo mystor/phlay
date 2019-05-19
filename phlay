@@ -503,13 +503,13 @@ class Revision(Cached):
             '', self.info(conduit)['fields']['summary'], count=1
         ).strip()
 
-    def edges(self, conduit):
+    def parents(self, conduit):
         info = self.info(conduit)
-        self._edges = conduit.do('edge.search',
+        parent_objs = conduit.do('edge.search',
                                  sourcePHIDs=[info['phid']],
                                  types=['revision.parent'],
                                  limit=900)['data']
-        return [edge['destinationPHID'] for edge in self._edges]
+        return [edge['destinationPHID'] for edge in parent_objs]
 
     def url(self, conduit):
         return f"https://{conduit.url.netloc}/D{self.revid}"
@@ -750,6 +750,8 @@ def process_args(args):
         print('  ' + style.bold_cyan(label))
         print('    ' + ' '.join(str(s) for s in rest).replace('\n', '\n    '))
 
+    pphids = []
+
     # Validate that everything exists, and show computed info
     for idx, commit in enumerate(push):
         print()
@@ -781,6 +783,18 @@ def process_args(args):
             if revfields['bugzilla.bug-id'] != str(commit.bug.bugno):
                 raise UserError('mismatched bug # ' +
                                 revfields['bugzilla.bug-id'])
+
+        if idx == 0 and start.revision and commit.revision:
+            # Preserve existing parent, to allow users to push a single commit
+            # without having to push the whole patch stack again.
+            local_parent_id = start.revision.info(conduit)['phid']
+            remote_parent_ids = commit.revision.parents(conduit)
+            if local_parent_id in remote_parent_ids and not args.no_parent:
+                print(style.green(f"  Depending on D{start.revision.revid}"))
+                pphids = remote_parent_ids
+            elif remote_parent_ids:
+                print(style.red(f"  and clear its parent dependencies"))
+                pphids = None
 
         # Always write out basic bug info
         try:
@@ -833,6 +847,12 @@ def process_args(args):
         if len(to_add) > 0:
             commit.add_transaction('reviewers.add', to_add)
 
+    if pphids is None:
+        pphids = []
+        # Show warning again in case the user did not see the previous message.
+        print()
+        print(style.red(f"Will clear parents of D{push[0].revision.revid}"))
+
     # Request user confirmation of printed information.
     if not args.assume_yes:
         if input(style.bold('\nProceed? (y/N) ')).lower() != 'y':
@@ -852,8 +872,9 @@ def process_args(args):
         print(style.bold_yellow(f"Requesting Review"), f"{commit.subject}")
 
         # Update dependency relationships if needed.
-        pphids = [] if idx == 0 else [parent.revision.info(conduit)['phid']]
-        if commit.revision is None or pphids != commit.revision.edges(conduit):
+        if idx != 0:
+            pphids = [parent.revision.info(conduit)['phid']]
+        if not commit.revision or pphids != commit.revision.parents(conduit):
             commit.add_transaction('parents.set', pphids)
 
         # Send the revision edit request.
@@ -917,6 +938,8 @@ def main():
     parser.add_argument('--color', default='auto', type=Style,
                         choices=['always', 'never', 'auto'],
                         help='control output colorization')
+    parser.add_argument('--no-parent', action='store_true',
+                        help='remove existing dependency on parent revision')
     parser.add_argument('--reopen', action='store_true',
                         help='re-open closed revisions')
     parser.add_argument('revspec', nargs='?', default='HEAD',
