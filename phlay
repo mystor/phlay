@@ -623,7 +623,7 @@ class Commit(Cached):
         # computed and cached.
         try:
             self.hg_hash = check_output([
-                'git-cinnabar', 'git2hg', self.commit_hash
+                'git', 'cinnabar', 'git2hg', self.commit_hash
             ]).decode().strip()
 
             # If we don't have a valid cinnabar hash, fall-back. If
