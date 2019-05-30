@@ -618,7 +618,7 @@ class Commit(Cached):
         self.bug = bugmatch and Bug(bugmatch.group(1))
 
         # Parse the reviewer list
-        reviewer_re = r'r((?:[?=,][^,\s]+)+)'
+        reviewer_re = r'\br((?:[?=,][^,\s]+)+)'
         self.reviewers = []
         for rmatch in re.finditer(reviewer_re, self.subject, re.I):
             for name in re.split(r'[?=,]', rmatch.group(1))[1:]:
