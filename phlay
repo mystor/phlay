@@ -15,10 +15,10 @@ import textwrap
 import shlex
 
 try:
-  # No curses support on Windows
-  import curses
+    # No curses support on Windows
+    import curses
 except ImportError:
-  curses = None
+    curses = None
 
 from distutils.version import StrictVersion
 from http.client import HTTPSConnection, HTTPException
