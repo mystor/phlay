@@ -1,3 +1,8 @@
+# Version 0.2.2
+
+* Only parse reviewers if the "r" is at a word boundary. (https://github.com/mystor/phlay/pull/64)
+* Avoid excessive whitespace within generated commit messages.
+
 # Version 0.2.1
 
 * Phlay should now work in the MozillaBuild shell (https://github.com/mystor/phlay/pull/57)
