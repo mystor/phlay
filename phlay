@@ -514,6 +514,9 @@ class Revision(Cached):
             }, attachments={'reviewers': True})
         return self._info
 
+    def title(self, conduit):
+        return self.info(conduit)['fields']['title']
+
     def summary(self, conduit):
         return self.DEP_SPEC.sub(
             '', self.info(conduit)['fields']['summary'], count=1
@@ -817,7 +820,7 @@ def process_args(args):
                 phid = commit.parent().revision.info(conduit)['phid']
                 parent_matches = [phid] == parent_phids
 
-            if parent_phids and not parent_matches:
+            if parent_phids and not parent_matches and not args.parent:
                 warn(commit, f"clearing {len(parent_phids)} parent revisions")
                 parent_phids = []
 
@@ -827,6 +830,31 @@ def process_args(args):
             label(f"Bug {commit.bug.bugno}", buginfo['summary'])
         except HTTPException as err:
             label(f"Bug {commit.bug.bugno}", style.red(f"<HTTP error> {err}"))
+
+        if idx == 0 and args.parent:
+            current_parent_phids = parent_phids
+            parent_rev = commit.parent().revision
+            if parent_rev:
+                parent_phids = [parent_rev.info(conduit)['phid']]
+                if not current_parent_phids:
+                    label('Parent Revision',
+                          f"Set dependency on D{parent_rev.revid}: {parent_rev.title(conduit)}")
+                elif current_parent_phids == parent_phids:
+                    label('Parent Revision',
+                          f"Keep dependency on D{parent_rev.revid}: {parent_rev.title(conduit)}")
+                else:
+                    label('Parent Revision',
+                          f"Reset dependency to D{parent_rev.revid}: {parent_rev.title(conduit)}")
+                    warn(commit, 'clearing existing parent revisions')
+            else:
+                if current_parent_phids:
+                    label('Parent Revision',
+                          'Keep existing dependency on parent revision')
+                else:
+                    label('Parent Revision', 'No parent dependencies')
+                warn(commit,
+                     f"could not find revision for parent commit:\n" +
+                     f"{commit.parent().abbrev} {commit.parent().subject}")
 
         # Log computed information about the patch to be pushed
         diff = commit.diff()
@@ -973,8 +1001,11 @@ def main():
     parser.add_argument('--color', default='auto', type=Style,
                         choices=['always', 'never', 'auto'],
                         help='control output colorization')
-    parser.add_argument('--no-parent', action='store_true',
+    parent = parser.add_mutually_exclusive_group()
+    parent.add_argument('--no-parent', action='store_true',
                         help='remove existing dependency on parent revision')
+    parent.add_argument('--parent', action='store_true',
+                        help='depend on the revision of the parent commit')
     parser.add_argument('--reopen', action='store_true',
                         help='re-open closed revisions')
     parser.add_argument('revspec', nargs='?', default='HEAD',
