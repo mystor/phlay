@@ -806,8 +806,11 @@ def process_args(args):
                 raise UserError('mismatched revision repository ' +
                                 revfields['repositoryPHID'])
             if revfields['bugzilla.bug-id'] != str(commit.bug.bugno):
-                raise UserError('mismatched bug # ' +
-                                revfields['bugzilla.bug-id'])
+                warn(commit,
+                     "mismatched bug ID. Changing from " +
+                     f"{revfields['bugzilla.bug-id'] or '<none>'} to " +
+                     f"{commit.bug.bugno}")
+                commit.add_transaction('bugzilla.bug-id', str(commit.bug.bugno))
 
         # If the initial commit has parents which match local repository state,
         # preserve them, allowing users to push a single commit without pushing
