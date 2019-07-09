@@ -27,6 +27,14 @@ being sent, or a patch is unlandable using `lando`, please
 
 > **NOTE** This tool doesn't currently support mercurial
 
+## Quick tutorial
+To set up phlay, enter the following in the terminal:
+```
+echo 'export PATH="$HOME/githubcode/phlay:$PATH"' >> ~/.bash_profile
+source ~/.bash_profile
+```
+To use it, navigate to your project and type in `phlay` to submit a patch. 
+
 ## Non-Mozilla
 
 This tool is fairly specialized for contributing to mozilla projects, including integration with https://bugzilla.mozilla.org, for example. It may not work well with other environments, but patches are welcome to make it cooperate better in those situations.
