@@ -24,7 +24,7 @@ from distutils.version import StrictVersion
 from http.client import HTTPSConnection, HTTPException
 from urllib.parse import urlencode, urlparse
 from subprocess import check_output, check_call, CalledProcessError
-from argparse import ArgumentParser
+from argparse import ArgumentParser, ArgumentTypeError
 from tempfile import TemporaryDirectory
 from collections import namedtuple
 from pathlib import Path
@@ -258,6 +258,7 @@ class Diff:
     def __init__(self, commit):
         self.commit = commit
         self.changes = {}
+        self.diffid = None
         self.phid = None
 
         raw = check_output(['git', 'diff-tree', '-r', '--raw', '-z', '-M', '-C',
@@ -447,6 +448,7 @@ class Diff:
                           # XXX(nika): This seems kinda irrelevant?
                           branch='HEAD')
         print(f"    Diff URI: {diff['uri']}")
+        self.diffid = diff['diffid']
 
         # Add information about our local commit to the patch. This info is
         # needed by lando.
@@ -741,6 +743,70 @@ def get_revisions(args):
     return start, ref, push, reparent
 
 
+def format_revision_description(description):
+    """
+    Validate the comment, for use as a description in do_edit_revision.
+    """
+    description = description.strip()
+
+    # The comment could be longer than 80, but it would then be truncated by:
+    # https://github.com/phacility/libphutil/blob/86ee6e90/src/utils/PhutilUTF8StringTruncator.php
+    # To make sure that the behavior is predictable, enforce a character limit.
+    if len(description) > 80:
+        raise ArgumentTypeError('Description cannot be longer than 80')
+
+    # Only the first line of the comment is used as a description.
+    if '\n' in description:
+        raise ArgumentTypeError('Description cannot contain line breaks')
+    return description
+
+
+def do_edit_revision(conduit, description, commit):
+    """
+    Create or updates a revision using the "differential.revision.edit" API:
+    https://secure.phabricator.com/conduit/method/differential.revision.edit/
+
+    If the revision exists, the |description| parameter will be assigned to the
+    "description" field of the diff, which is visible at the history view of
+    a revision on Phabricator.
+    If the revision does not exist yet, the description cannot be changed.
+
+    |description| will also be posted as a comment in the revision.
+    """
+
+    if description and not commit.revision:
+        # The first diff of a revision is always called "Base".
+        # Since it cannot be changed, just post a comment.
+        commit.add_transaction('comment', description)
+        description = None
+
+    # The diff description cannot be set via the "differential.revision.edit"
+    # API. We have to use the deprecated "differential.updaterevision" method
+    # instead. The logic of interest is the `$diff->setDescription` part at:
+    # https://github.com/phacility/phabricator/blob/f1a588c7/src/applications/differential/conduit/DifferentialConduitAPIMethod.php#L87-L99
+    # https://github.com/phacility/phabricator/blob/f1a588c7/src/applications/differential/conduit/DifferentialUpdateRevisionConduitAPIMethod.php
+    if description:
+        updateparams = {
+            'id': commit.revision.revid,
+            'diffid': commit.diff().diffid,
+            'message': description,
+        }
+        # Upload the diff + comment first, and then the others.
+        conduit.do('differential.updaterevision', **updateparams)
+        transactions = [t for t in commit.transactions if t['type'] != 'update']
+        if not transactions:
+            # This was apparently a diff + comment-only update.
+            return commit.revision
+    else:
+        transactions = commit.transactions
+
+    params = {'transactions': transactions}
+    if commit.revision:
+        params['objectIdentifier'] = commit.revision.info(conduit)['phid']
+    editrv = conduit.do('differential.revision.edit', **params)
+    return commit.revision or Revision(editrv['object']['id'])
+
+
 def process_args(args):
     style = args.color
     try:
@@ -905,6 +971,9 @@ def process_args(args):
         if len(to_add) > 0:
             commit.add_transaction('reviewers.add', to_add)
 
+        if args.comment:
+            label('Comment and description in revision history', args.comment)
+
     # Re-display any warnings in case they were lost in the spew.
     show_warning_header = True
     for commit in push:
@@ -946,16 +1015,10 @@ def process_args(args):
             commit.add_transaction('parents.set', parent_phids)
 
         # Send the revision edit request.
-        params = {'transactions': commit.transactions}
-        if commit.revision is not None:
-            params['objectIdentifier'] = commit.revision.info(conduit)['phid']
-        editrv = conduit.do('differential.revision.edit', **params)
+        revision = do_edit_revision(conduit, args.comment, commit)
 
         # Get additional information about the newly created revision
-        if commit.revision is None:
-            revurl = Revision(editrv['object']['id']).url(conduit)
-        else:
-            revurl = commit.revision.url(conduit)
+        revurl = revision.url(conduit)
         print(f"    Revision URI: {revurl}")
 
         # Perform a rewrite of the commit, and move to the next
@@ -1006,6 +1069,10 @@ def main():
     parser.add_argument('--color', default='auto', type=Style,
                         choices=['always', 'never', 'auto'],
                         help='control output colorization')
+    parser.add_argument('--comment', type=format_revision_description,
+                        help='set the "Description" field in the revision\'s ' +
+                             'History view of Phabricator. The message is ' +
+                             'also posted as a comment')
     parent = parser.add_mutually_exclusive_group()
     parent.add_argument('--no-parent', action='store_true',
                         help='remove existing dependency on parent revision')
