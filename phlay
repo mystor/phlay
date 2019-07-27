@@ -566,7 +566,7 @@ class Reviewer(Cached):
                 # First, we try to locate a user with the reviewer's name.
                 self._info = conduit.search_one('user', {
                     'usernames': [self.tag]
-                })
+                }, attachments={'availability': True})
             except UserError:
                 try:
                     # Then we locate a project based on its slug.
@@ -890,9 +890,14 @@ def process_args(args):
             if reviewerinfo['phid'] not in rev_phids:
                 to_add.append(f"blocking({reviewerinfo['phid']})")
                 if reviewerinfo['type'] == 'USER':
-                    label('Add Reviewer',
-                          reviewerinfo['fields']['realName'],
-                          f"[:{reviewerinfo['fields']['username']}]")
+                    describe = reviewerinfo['fields']['realName'] + \
+                        f" [:{reviewerinfo['fields']['username']}]"
+                    label('Add Reviewer', describe)
+
+                    availability = reviewerinfo['attachments']['availability']
+                    if availability['value'] != 'available':
+                        warn(commit, style.red(f"Reviewer {describe} Unavailable"))
+
                 elif reviewerinfo['type'] == 'PROJ':
                     label('Add Reviewer',
                           reviewerinfo['fields']['name'],
