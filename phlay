@@ -957,7 +957,10 @@ def process_args(args):
         for reviewer in commit.reviewers:
             reviewerinfo = reviewer.info(conduit)
             if reviewerinfo['phid'] not in rev_phids:
-                to_add.append(f"blocking({reviewerinfo['phid']})")
+                if args.reviewer_kind == 'blocking':
+                    to_add.append(f"blocking({reviewerinfo['phid']})")
+                else:
+                    to_add.append(f"{reviewerinfo['phid']}")
                 if reviewerinfo['type'] == 'USER':
                     describe = reviewerinfo['fields']['realName'] + \
                         f" [:{reviewerinfo['fields']['username']}]"
@@ -1072,6 +1075,9 @@ def main():
     parser.add_argument('--color', default='auto', type=Style,
                         choices=['always', 'never', 'auto'],
                         help='control output colorization')
+    parser.add_argument('--reviewer-kind', default='blocking',
+                        choices=['blocking', 'non-blocking'],
+                        help='choose whether reviewers are blocking or not')
     parser.add_argument('--comment', type=format_revision_description,
                         help='set the "Description" field in the revision\'s ' +
                              'History view of Phabricator. The message is ' +
