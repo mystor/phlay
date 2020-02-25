@@ -1,3 +1,16 @@
+# Version 0.2.3
+
+* Fixed errors produced by phabricator when trying to submit patches. (https://github.com/mystor/phlay/pull/73)
+
+In addition, a number of changes were landed months ago, but never given a
+version, including:
+
+* Support for specifying non-blocking reviwers. (https://github.com/mystor/phlay/pull/71)
+* Modifying the BMO ID is now a warning, instead of error. (https://github.com/mystor/phlay/pull/69)
+* Allow setting the diff description with --comment flag. (https://github.com/mystor/phlay/pull/68)
+* Append to an existing revision stack without bulk updates. (https://github.com/mystor/phlay/pull/67)
+* Emit a warning if a reviewer is unavailable (https://github.com/mystor/phlay/pull/65)
+
 # Version 0.2.2
 
 * Only parse reviewers if the "r" is at a word boundary. (https://github.com/mystor/phlay/pull/64)
