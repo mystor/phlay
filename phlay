@@ -456,7 +456,7 @@ class Diff:
                    diff_id=diff['diffid'],
                    name='local:commits',
                    data=json.dumps({
-                       self.commit.hg_hash: {
+                       self.commit.commit_hash: {
                            'author': self.commit.author_name,
                            'authorEmail': self.commit.author_email,
                            'time': int(self.commit.unix_date),
@@ -465,6 +465,7 @@ class Diff:
                            'commit': self.commit.hg_hash,
                            'tree': self.commit.tree_hash,
                            'parents': [self.commit.parent().hg_hash],
+                           'rev': self.commit.commit_hash,
                        }
                    }))
 
