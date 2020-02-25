@@ -2,6 +2,15 @@
 
 Phlay handles pushing commit series to Mozilla's phabricator instance efficiently. Phlay was written before `moz-phab` supported git setups, and was made to enable using an efficient patch-stack based phab workflow.
 
+> **NOTE** This is _not_ an official mozilla project, and is not receiving
+> active development or releases. Occasionally the phabricator configuration
+> will change, and uploads with `phlay` will fail until it is fixed.
+>
+> I would generally recommend using the officially maintained
+> [`moz-phab`](https://github.com/mozilla-conduit/review) tool, as it is tested
+> against our specific phabricator config, has more features, and is updated
+> more frequently.
+
 ## Features
 
  * Self-contained Python script, with no `php` or `arc` dependencies
