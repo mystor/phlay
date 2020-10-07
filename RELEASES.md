@@ -1,3 +1,7 @@
+# Version 0.2.4
+
+* Fixed various diff generation issues when adding empty files. (https://github.com/mystor/phlay/pull/76)
+
 # Version 0.2.3
 
 * Fixed errors produced by phabricator when trying to submit patches. (https://github.com/mystor/phlay/pull/73)

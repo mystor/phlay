@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-__version__ = '0.2.3'
+__version__ = '0.2.4'
 # ^ The version is used for update checks and must contain at most three parts.
 
 import sys
