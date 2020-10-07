@@ -295,12 +295,12 @@ class Diff:
         change = self.change_for(b_path)
 
         # Extract the bodies of blobs to compare
-        if a_blob == NULL_SHA1:
+        if a_blob in (NULL_SHA1, EMPTY_BLOB):
             a_blob, a_body = EMPTY_BLOB, b''
         else:
             a_body = check_output(['git', 'cat-file', 'blob', a_blob])
 
-        if b_blob == NULL_SHA1:
+        if b_blob in (NULL_SHA1, EMPTY_BLOB):
             b_blob, b_body = EMPTY_BLOB, b''
         else:
             b_body = check_output(['git', 'cat-file', 'blob', b_blob])
