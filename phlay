@@ -358,15 +358,16 @@ class Diff:
                     if line[0] != '-':
                         new_eof_newline = False
 
-            change.hunks = [self.Hunk(
-                old_off=old_off, old_len=old_len,
-                new_off=new_off, new_len=new_len,
-                old_eof_newline=old_eof_newline,
-                new_eof_newline=new_eof_newline,
-                added=sum(1 for l in lines if l[0] == '+'),
-                deleted=sum(1 for l in lines if l[0] == '-'),
-                corpus=corpus,
-            )]
+            if corpus:
+                change.hunks = [self.Hunk(
+                    old_off=old_off, old_len=old_len,
+                    new_off=new_off, new_len=new_len,
+                    old_eof_newline=old_eof_newline,
+                    new_eof_newline=new_eof_newline,
+                    added=sum(1 for l in lines if l[0] == '+'),
+                    deleted=sum(1 for l in lines if l[0] == '-'),
+                    corpus=corpus,
+                )]
             change.file_type = self.FileType.TEXT
 
         # Determine the correct kind from the letter
