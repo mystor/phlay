@@ -371,7 +371,7 @@ class Diff:
             change.file_type = self.FileType.TEXT
 
         # Determine the correct kind from the letter
-        if kind_l[0] == 'A':
+        if kind_l[0] == 'A' or kind_l[0] == 'C' and b_blob == EMPTY_BLOB:
             change.kind = self.Kind.ADD
             change.cur_mode = b_mode
 
