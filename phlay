@@ -306,7 +306,15 @@ class Diff:
             b_body = check_output(['git', 'cat-file', 'blob', b_blob])
 
         # Detect if we're binary, and generate a unified diff
-        change.binary = b'\0' in a_body or b'\0' in b_body
+        def is_binary(body):
+            try:
+                body.decode('utf-8')
+            except UnicodeError:
+                return True
+            return b'\0' in body
+
+        change.binary = is_binary(a_body) or is_binary(b_body)
+
         if change.binary:
             a_mime = mimetypes.guess_type(a_path)[0] or ''
             b_mime = mimetypes.guess_type(b_path)[0] or ''
