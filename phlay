@@ -307,11 +307,13 @@ class Diff:
 
         # Detect if we're binary, and generate a unified diff
         def is_binary(body):
+            if b'\0' in body:
+                return True
             try:
                 body.decode('utf-8')
             except UnicodeError:
                 return True
-            return b'\0' in body
+            return False
 
         change.binary = is_binary(a_body) or is_binary(b_body)
 
