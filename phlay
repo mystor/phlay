@@ -20,7 +20,6 @@ try:
 except ImportError:
     curses = None
 
-from distutils.version import StrictVersion
 from http.client import HTTPSConnection, HTTPException
 from urllib.parse import urlencode, urlparse
 from subprocess import check_output, check_call, CalledProcessError
@@ -1058,6 +1057,24 @@ def process_args(args):
             ref, parent.commit_hash, initial_ref.commit_hash,
         ])
 
+# distutils is going away, so let's not use StrictVersion.
+# Let's avoid having to rely on installing setuputils, too.
+def version_less(a, b):
+    a = [int(x) for x in a.split('.')]
+    b = [int(x) for x in b.split('.')]
+    while len(a) < len(b):
+        a.append(0)
+    while len(b) < len(a):
+        b.append(0)
+    return a < b
+assert(version_less('1.2', '1.2.4'))
+assert(version_less('1.2.3', '1.2.4'))
+assert(not version_less('1.2.4', '1.2.4'))
+assert(version_less('1.2.4', '1.2.4.1'))
+assert(not version_less('1.2.5', '1.2.4'))
+assert(not version_less('1.3', '1.2.4'))
+assert(not version_less('1.10', '1.2.4'))
+
 
 def update_check(style):
     conn = HTTPSConnection('raw.githubusercontent.com')
@@ -1065,7 +1082,7 @@ def update_check(style):
     resp = conn.getresponse().read().decode()
     match = re.search(r"__version__\s*=\s*'([0-9.]+)'", resp, re.I)
     new_version = match.group(1) if match else '0.1.0'
-    if StrictVersion(new_version) > StrictVersion(__version__):
+    if version_less(__version__, new_version):
         changes = f"RELEASES.md#version-{new_version.replace('.', '')}"
         print(textwrap.dedent(f"""
             {style.bold_yellow("NOTE: New Version Available")}
