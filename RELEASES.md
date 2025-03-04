@@ -1,3 +1,5 @@
+* Support git checkouts without git-cinnabar on Linux and macOS too
+
 # Version 0.2.4
 
 * Fixed various diff generation issues when adding empty files. (https://github.com/mystor/phlay/pull/76)

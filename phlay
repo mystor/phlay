@@ -663,7 +663,7 @@ class Commit(Cached):
             # '--hg-bundle' is passed, this will be corrected before pushing.
             if self.hg_hash == NULL_SHA1:
                 self.hg_hash = self.commit_hash
-        except FileNotFoundError:
+        except (CalledProcessError, FileNotFoundError):
             # Handle git-cinnabar being uninstalled
             self.hg_hash = self.commit_hash
 
