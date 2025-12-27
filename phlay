@@ -32,6 +32,7 @@ from enum import Enum
 
 NULL_SHA1 = '0' * 40
 EMPTY_BLOB = 'e69de29bb2d1d6434b8b29ae775ad8c2e48c5391'
+USER_AGENT = f"phlay/{__version__}"
 
 
 class Style:
@@ -125,6 +126,7 @@ class Conduit:
         self.hostname = socket.gethostname()
 
     def do(self, cmd_name, **params):
+        headers = {"User-Agent": USER_AGENT}
         # Add the token & write out parameters.
         params['__conduit__'] = { 'token': self.token }
         body = urlencode({
@@ -135,7 +137,7 @@ class Conduit:
 
         # Send the POST request
         conn = HTTPSConnection(self.url.netloc)
-        conn.request("POST", f'/api/{cmd_name}', body=body)
+        conn.request("POST", f'/api/{cmd_name}', body=body, headers=headers)
 
         # Read the response as JSON
         resp = json.load(conn.getresponse())
@@ -555,8 +557,9 @@ class Bug(Cached):
 
     def info(self, _conduit):
         if self._info is None:
+            headers = {"User-Agent": USER_AGENT}
             conn = HTTPSConnection('bugzilla.mozilla.org')
-            conn.request('GET', f"/rest/bug/{self.bugno}")
+            conn.request('GET', f"/rest/bug/{self.bugno}", headers=headers)
             resp = json.load(conn.getresponse())
             if resp.get('error', False):
                 if resp['code'] != 102:  # Not an access error
