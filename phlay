@@ -66,6 +66,20 @@ class UserError(Exception):
     pass
 
 
+def response_to_json(response):
+    """Read response from http.client.HTTPResponse as JSON"""
+    responseText = response.read()
+    try:
+        return json.loads(responseText)
+    except Exception as e:
+        # When the WAF blocks the request, HTTP 406 may be returned with an
+        # empty response body. Print the raw response for diagnostics.
+        print(f"HTTP {response.status} {response.reason}", file=sys.stderr)
+        print(response.headers, file=sys.stderr)
+        print(responseText, file=sys.stderr)
+        raise e
+
+
 class Conduit:
     def __init__(self, arcrc_path):
         # Load the global and local Arcanist configuration
@@ -140,7 +154,7 @@ class Conduit:
         conn.request("POST", f'/api/{cmd_name}', body=body, headers=headers)
 
         # Read the response as JSON
-        resp = json.load(conn.getresponse())
+        resp = response_to_json(conn.getresponse())
         if resp['error_code'] is not None:
             raise UserError(f"conduit[{resp['error_code']}]: {resp['error_info']}")
         return resp['result']
@@ -550,7 +564,7 @@ class Bug(Cached):
             headers = {"User-Agent": USER_AGENT}
             conn = HTTPSConnection('bugzilla.mozilla.org')
             conn.request('GET', f"/rest/bug/{self.bugno}", headers=headers)
-            resp = json.load(conn.getresponse())
+            resp = response_to_json(conn.getresponse())
             if resp.get('error', False):
                 if resp['code'] != 102:  # Not an access error
                     raise UserError(resp['message'])
