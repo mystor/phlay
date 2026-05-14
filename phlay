@@ -481,16 +481,6 @@ class Diff:
                        }
                    }))
 
-        # (try to) add metadata about the phlay version to our diff.
-        try:
-            conduit.do('differential.setdiffproperty',
-                       diff_id=diff['diffid'],
-                       name='phlay:version',
-                       data=json.dumps(__version__))
-        except:
-            # It's OK if this fails.
-            print(style.yellow("note"), "phlay version annotation failed")
-
         return diff['phid']
 
 
