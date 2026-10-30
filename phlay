@@ -30,6 +30,8 @@ from pathlib import Path
 from enum import Enum
 
 
+_repo_vcs = None
+
 NULL_SHA1 = '0' * 40
 EMPTY_BLOB = 'e69de29bb2d1d6434b8b29ae775ad8c2e48c5391'
 USER_AGENT = f"phlay/{__version__}"
@@ -226,7 +228,7 @@ class Diff:
                 'awayPaths': self.away_paths,
                 'oldProperties': old_props,
                 'newProperties': cur_props,
-                'commitHash': commit.hg_hash,
+                'commitHash': commit.src_hash,
                 'type': self.kind.value,
                 'fileType': self.file_type.value,
                 'hunks': hunks,
@@ -463,9 +465,9 @@ class Diff:
         diff = conduit.do('differential.creatediff',
                           changes=changes,
                           sourceMachine=conduit.hostname,
-                          sourceControlSystem='hg',
+                          sourceControlSystem=conduit.repository['fields']['vcs'],
                           sourceControlPath='/',
-                          sourceControlBaseRevision=self.commit.parent().hg_hash,
+                          sourceControlBaseRevision=self.commit.parent().src_hash,
                           creationMethod='phlay',
                           lintStatus='none',
                           unitStatus='none',
@@ -488,9 +490,9 @@ class Diff:
                            'time': int(self.commit.unix_date),
                            'summary': self.commit.subject,
                            'message': self.commit.raw_body.strip(),
-                           'commit': self.commit.hg_hash,
+                           'commit': self.commit.src_hash,
                            'tree': self.commit.tree_hash,
-                           'parents': [self.commit.parent().hg_hash],
+                           'parents': [self.commit.parent().src_hash],
                            'rev': self.commit.commit_hash,
                        }
                    }))
@@ -659,20 +661,16 @@ class Commit(Cached):
 
         self.title = re.sub(reviewer_re, '', self.subject, flags=re.I).strip()
 
-        # Check if this commit has a corresponding mercurial hash already
-        # computed and cached.
-        try:
-            self.hg_hash = check_output([
-                'git', 'cinnabar', 'git2hg', self.commit_hash
-            ]).decode().strip()
-
-            # If we don't have a valid cinnabar hash, fall-back. If
-            # '--hg-bundle' is passed, this will be corrected before pushing.
-            if self.hg_hash == NULL_SHA1:
-                self.hg_hash = self.commit_hash
-        except (CalledProcessError, FileNotFoundError):
-            # Handle git-cinnabar being uninstalled
-            self.hg_hash = self.commit_hash
+        self.src_hash = self.commit_hash
+        if _repo_vcs == 'hg':
+            try:
+                hg_hash = check_output(
+                    ['git', 'cinnabar', 'git2hg', self.commit_hash
+                    ]).decode().strip()
+                if hg_hash and hg_hash != NULL_SHA1:
+                    self.src_hash = hg_hash
+            except (CalledProcessError, FileNotFoundError):
+                pass
 
 
     def parent(self):
@@ -835,6 +833,8 @@ def process_args(args):
 
     # Set up state for arguments
     conduit = Conduit(args.arcrc)
+    global _repo_vcs
+    _repo_vcs = conduit.repository['fields']['vcs']
     start, ref, push, reparent = get_revisions(args)
 
     # Stash the current sha1 for |ref|
