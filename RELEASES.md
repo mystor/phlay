@@ -1,3 +1,4 @@
+* Support marking revisions as WIP ("Changes Planned") via `--wip`
 * Support git checkouts without git-cinnabar on Linux and macOS too
 
 # Version 0.2.4
