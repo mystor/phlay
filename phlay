@@ -1038,8 +1038,25 @@ def process_args(args):
         if not commit.revision or parent_phids != commit.revision.parents(conduit):
             commit.add_transaction('parents.set', parent_phids)
 
+        # Phabricator rejects "plan-changes" on a revision which is already
+        # "Changes Planned", but uploading a new diff moves it back to
+        # "Needs Review". In that case, plan changes in a separate edit.
+        replan = False
+        if args.wip:
+            status = commit.revision and \
+                commit.revision.info(conduit)['fields']['status']['value']
+            if status == 'changes-planned':
+                replan = True
+            else:
+                commit.add_transaction('plan-changes', True)
+
         # Send the revision edit request.
         revision = do_edit_revision(conduit, args.comment, commit)
+
+        if replan:
+            conduit.do('differential.revision.edit',
+                       objectIdentifier=revision.info(conduit)['phid'],
+                       transactions=[{'type': 'plan-changes', 'value': True}])
 
         # Get additional information about the newly created revision
         revurl = revision.url(conduit)
@@ -1123,6 +1140,8 @@ def main():
                         help='remove existing dependency on parent revision')
     parent.add_argument('--parent', action='store_true',
                         help='depend on the revision of the parent commit')
+    parser.add_argument('--wip', action='store_true',
+                        help='mark revisions as "Changes Planned"')
     parser.add_argument('--reopen', action='store_true',
                         help='re-open closed revisions')
     parser.add_argument('revspec', nargs='?', default='HEAD',
